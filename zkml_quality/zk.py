@@ -65,6 +65,30 @@ class ZkError(Exception):
     """Raised for any invalid input, artifact mismatch or EZKL failure."""
 
 
+class ZkInputError(ZkError):
+    """The request or its input document is invalid (bad arguments/features)."""
+
+
+class ZkArtifactMissing(ZkError):
+    """A required artifact (model, setup, credential target directory) is absent."""
+
+
+class ZkArtifactError(ZkError):
+    """An artifact exists but is corrupt or unreadable."""
+
+
+class ZkDigestMismatch(ZkError):
+    """An artifact or credential does not hash to its pinned digest."""
+
+
+class ZkEzklError(ZkError):
+    """EZKL itself failed (witness, proving or verification)."""
+
+
+class ZkOutputError(ZkError):
+    """Writing the output artifact failed."""
+
+
 def ezkl_version():
     try:
         return importlib.metadata.version("ezkl")
@@ -110,7 +134,7 @@ def _quiet_stderr():
         detail = tail[-1].strip() if tail else str(error)
         if isinstance(error, ZkError):
             raise
-        raise ZkError(f"EZKL failed: {detail}") from error
+        raise ZkEzklError(f"EZKL failed: {detail}") from error
     finally:
         os.dup2(saved, 2)
         os.close(saved)
@@ -347,38 +371,76 @@ def _read_proof_document(path):
     return proof_doc
 
 
-def run_prove(input_path, model, setup_dir, credential_path):
-    """Generate witness and a real proof for one private feature vector."""
-    input_path = _require_file(input_path, "input file")
-    model = _require_file(model, "ONNX model")
-    setup_dir = Path(setup_dir)
-    if not setup_dir.is_dir():
-        raise ZkError(f"setup directory not found: {setup_dir}")
-    credential_path = Path(credential_path)
-    if credential_path.is_dir():
-        raise ZkError(f"credential path is a directory: {credential_path}")
-    if not credential_path.resolve().parent.is_dir():
-        raise ZkError(f"credential output directory does not exist: {credential_path.parent}")
+def _require_input_file(path, description):
+    path = Path(path)
+    if not path.is_file():
+        raise ZkArtifactMissing(f"{description} not found")
+    return path
 
+
+def _load_prove_features(input_path):
+    """Read and validate the private feature vector, without revealing it."""
     try:
         document = json.loads(input_path.read_text(encoding="utf-8"),
                               parse_constant=lambda value: (_ for _ in ()).throw(
                                   ValueError(f"invalid JSON constant {value}")))
-    except (OSError, json.JSONDecodeError, ValueError) as error:
-        raise ZkError(f"invalid input JSON ({input_path}): {error}") from error
-    try:
-        features = validate_features(document)  # identical six-dimension contract as `infer`
+    except json.JSONDecodeError as error:
+        raise ZkInputError(f"input file is not valid JSON: {error.msg}") from error
+    except OSError as error:
+        raise ZkArtifactError(f"input file cannot be read: {error.strerror}") from error
     except ValueError as error:
-        raise ZkError(str(error)) from error
+        raise ZkInputError(str(error)) from error
+    try:
+        return validate_features(document)  # identical six-dimension contract as `infer`
+    except ValueError as error:
+        raise ZkInputError(str(error)) from error
 
-    manifest = _read_manifest(setup_dir / MANIFEST_NAME)
-    model_sha = _sha256(model)
+
+def _prepare_prove(input_path, model, setup_dir, credential_path):
+    """Validate every private/public input of a proof request, without proving.
+
+    Returns only non-sensitive, reusable facts: the validated feature vector
+    (kept in memory by the caller, never persisted), the setup paths, the
+    model digest and the output scale.
+    """
+    input_path = _require_input_file(input_path, "input file")
+    model = _require_input_file(model, "ONNX model")
+    setup_dir = Path(setup_dir)
+    if not setup_dir.is_dir():
+        raise ZkArtifactMissing("setup directory not found")
+    credential_path = Path(credential_path)
+    if credential_path.is_dir():
+        raise ZkInputError("credential output path is a directory")
+    if not credential_path.resolve().parent.is_dir():
+        raise ZkArtifactMissing("credential output directory does not exist")
+
+    features = _load_prove_features(input_path)
+
+    try:
+        manifest = _read_manifest(setup_dir / MANIFEST_NAME)
+    except ZkArtifactMissing:
+        raise
+    except ZkError as error:
+        raise ZkArtifactError(str(error)) from error
+    try:
+        model_sha = _sha256(model)
+    except OSError as error:
+        raise ZkArtifactError(f"ONNX model cannot be read: {error.strerror or error}") from error
     if model_sha != manifest["model_sha256"]:
-        raise ZkError("model does not match the model this setup was built for")
-    paths = _artifact_paths(setup_dir)
-    _check_artifacts(manifest, paths)
+        raise ZkDigestMismatch("model does not match the model this setup was built for")
+    try:
+        paths = _artifact_paths(setup_dir)
+        _check_artifacts(manifest, paths)
+    except ZkArtifactMissing:
+        raise
+    except ZkError as error:
+        raise ZkDigestMismatch(str(error)) from error
     scale = int(manifest["output_scale"])
+    return features, paths, model_sha, scale, credential_path
 
+
+def _issue_credential(features, paths, model_sha, scale, credential_path):
+    """Run the real EZKL witness/prove/self-verify and publish a credential."""
     with tempfile.TemporaryDirectory(prefix="zkprove-") as scratch:
         scratch = Path(scratch)
         ezkl_input = scratch / "witness-input.json"
@@ -389,15 +451,15 @@ def run_prove(input_path, model, setup_dir, credential_path):
             witness = ezkl.gen_witness(
                 str(ezkl_input), str(paths["compiled"]), str(witness_path), None, None)
             if not isinstance(witness, dict) or "outputs" not in witness:
-                raise ZkError("witness generation produced no public outputs")
+                raise ZkEzklError("witness generation produced no public outputs")
             proof_result = ezkl.prove(str(witness_path), str(paths["compiled"]),
                                       str(paths["pk"]), str(proof_path), str(paths["srs"]))
             if not proof_path.is_file() or not isinstance(proof_result, dict):
-                raise ZkError("proving did not produce a proof")
+                raise ZkEzklError("proving did not produce a proof")
             # Self-check before issuing a credential; requires local artifacts only.
             if ezkl.verify(str(proof_path), str(paths["settings"]), str(paths["vk"]),
                            str(paths["srs"]), False) is not True:
-                raise ZkError("freshly generated proof failed local verification")
+                raise ZkEzklError("freshly generated proof failed local verification")
 
         proof_doc = _read_proof_document(proof_path)
         scores, fixed_point, label = _decode_instances(proof_doc["instances"], scale)
@@ -406,7 +468,7 @@ def run_prove(input_path, model, setup_dir, credential_path):
         # public instances that actually went into the proof.
         witness_scores, _, witness_label = _decode_instances(witness["outputs"], scale)
         if witness_scores != scores or witness_label != label:
-            raise ZkError("witness outputs and proof instances disagree")
+            raise ZkEzklError("witness outputs and proof instances disagree")
 
     credential = {
         "format_version": FORMAT_VERSION,
@@ -426,8 +488,22 @@ def run_prove(input_path, model, setup_dir, credential_path):
         },
         "proof": proof_doc,
     }
-    _write_credential(credential, credential_path)
+    try:
+        _write_credential(credential, credential_path)
+    except OSError as error:
+        raise ZkOutputError(f"cannot write credential: {error.strerror or error}") from error
+    return scores, label
+
+
+def run_prove(input_path, model, setup_dir, credential_path):
+    """Generate witness and a real proof for one private feature vector."""
+    features, paths, model_sha, scale, credential_path = _prepare_prove(
+        input_path, model, setup_dir, credential_path)
+    scores, label = _issue_credential(
+        features, paths, model_sha, scale, credential_path)
+    credential_sha = _sha256(credential_path)
     return {"credential": str(credential_path), "model_sha256": model_sha,
+            "credential_sha256": credential_sha,
             "quantized_scores": scores, "label": label}
 
 

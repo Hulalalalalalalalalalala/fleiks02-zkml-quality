@@ -178,6 +178,89 @@ two are compared on every verification, so a stale or altered registry record
 cannot point verification at different settings/VK/SRS than the manifest
 pins.
 
+### Durable proof tasks: `proof-task`
+
+`proof-task` wraps the prover side of the loop in a durable, strictly
+state-machined task library stored in one prover-owned JSON file named by
+`--store` (a sibling `<store>.lock` serialises workers). Everything stays
+local and offline, and a successful task run performs the **same real EZKL
+proof** as `zk-prove` — nothing is mocked.
+
+```sh
+python -m zkml_quality proof-task create --store prover/tasks.json \
+    --input samples/normal.json --model models/quality.onnx \
+    --setup-dir setup --credential credential.json \
+    [--idempotency-key <token>]
+# -> {task_id, state:"queued", attempt:0, ...}   (atomic; repeats with the same
+#    key and the identical request return the original task; the same key with
+#    a different request is rejected with idempotency_conflict)
+
+python -m zkml_quality proof-task status --store prover/tasks.json --task-id <id>
+python -m zkml_quality proof-task run    --store prover/tasks.json --task-id <id>
+# -> queued -> running -> succeeded/failed; only one runner can ever claim a
+#    task (a competing run fails with conflict), and each execution increments
+#    `attempt` with its own started/ended timestamps.
+python -m zkml_quality proof-task retry  --store prover/tasks.json --task-id <id>
+# -> only a `failed` task whose last attempt is marked retryable is re-queued;
+#    queued/running/succeeded and terminal failures are rejected.
+```
+
+`create` takes exactly the `zk-prove` arguments (`--input`, `--model`,
+`--setup-dir`, `--credential`) and validates the whole request — the six
+features, the setup manifest, the model and every setup artifact — before the
+task id exists. The request is then sealed: the SHA-256 of the input, model,
+manifest and all five setup artifacts (plus the resolved argument set) are
+recorded, so anything changed or swapped between `create` and `run` fails the
+attempt with `digest_mismatch` without invoking EZKL. The feature values
+themselves are **never persisted**; the input file is read again at run time.
+
+Lifecycle and durability:
+
+* Only `queued → running → succeeded | failed` transitions occur. The claim
+  (`running`) is committed to the store before proving starts, so a competing
+  `run` always fails with `conflict`; the full per-attempt history (attempt
+  number, state, started/ended, error code, credential digest) is retained and
+  never rewritten.
+* Success is recorded only after a real credential file exists: its
+  SHA-256 is stored in `credential_sha256` (and in the attempt record). A
+  failure or interruption can never report success, overwrite a pre-existing
+  credential, or drop history.
+* A `KeyboardInterrupt`/process death during proving is caught and recorded as
+  a `failed`, retryable attempt with code `interrupted` (an executor killed
+  before the failure can be journaled honestly remains `running` and can never
+  be claimed a second time).
+* Every store update is atomic: same-directory temp file, `fsync`,
+  `os.replace`. A missing, corrupt or structurally illegal store — including an
+  illegal on-disk state or a broken request seal — is refused and the existing
+  file is preserved byte-for-byte.
+
+Every **successful** command prints one JSON object to stdout and nothing to
+stderr, containing exactly `task_id`, `state`, `attempt`, `created_at`,
+`started_at`, `ended_at`, `updated_at` and `credential_sha256`. On failure the
+command exits nonzero, writes nothing to stdout, and prints one JSON object to
+stderr whose `error` block carries a stable `code`, a boolean `retryable` and a
+fixed non-revealing `message` (a failed `run` also includes the post-transition
+task fields). The codes distinguish:
+
+| `error.code` | Meaning | retryable |
+| --- | --- | --- |
+| `invalid_request` | Malformed command/task arguments | no |
+| `invalid_input` | Input document fails the six-feature contract | no |
+| `artifact_missing` | Model, setup or output-directory artifact absent/unreadable | yes |
+| `digest_mismatch` | A sealed digest does not match (tampering or swapped artifacts) | no |
+| `ezkl_failure` | Witness/proving/self-verification failed inside EZKL | yes |
+| `output_io_failure` | The credential could not be written | yes |
+| `interrupted` | The attempt was interrupted | yes |
+| `task_not_found` / `invalid_state` / `conflict` / `idempotency_conflict` | Store control failures | no |
+| `store_corrupt` / `store_io` | Task library corrupt/illegal or unreadable | no / yes |
+
+No output — success or failure — ever contains `features`, the input content,
+proof bytes, or file paths; paths live only in the on-disk job request because
+the local worker needs them to perform the deferred proof. The produced
+credential is the standard `zk-quality-credential`, so `zk-verify`, the model
+registry, manifest pinning, quantisation and all credential-privacy behaviour
+are unchanged.
+
 ### Credential format
 
 `credential.json` is the only artifact exchanged between prover and verifier:
