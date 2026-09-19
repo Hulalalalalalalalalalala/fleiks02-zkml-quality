@@ -4,6 +4,13 @@ import sys
 from pathlib import Path
 
 from .inference import ROOT, infer
+from .prooftask import (
+    ProofTaskError,
+    create_task,
+    retry_task,
+    run_task,
+    status_task,
+)
 from .registry import (
     RegistryError,
     enable_model,
@@ -81,6 +88,32 @@ def _parser():
     revoke.add_argument(
         "--version", required=True,
         help="Model version token matching [A-Za-z0-9._-]+")
+
+    proof_task = sub.add_parser(
+        "proof-task",
+        help="Manage the prover's offline proof-task library (create/status/run/retry)")
+    task_sub = proof_task.add_subparsers(dest="task_command", required=True)
+
+    create = task_sub.add_parser(
+        "create", help="Validate a prove request and record a queued task")
+    create.add_argument("--store", required=True, type=Path, help="Proof-task store directory")
+    create.add_argument("--input", required=True, type=Path, help="JSON input containing features")
+    create.add_argument("--model", required=True, type=Path, help="ONNX model used at setup")
+    create.add_argument("--setup-dir", required=True, type=Path, help="Directory from zk-setup")
+    create.add_argument("--credential", required=True, type=Path, help="Credential JSON to write")
+    create.add_argument(
+        "--idempotency-key", default=None,
+        help="Reuse the original task when the identical request is resubmitted; "
+             "a different request with the same key is rejected")
+
+    for name, help_text in (
+            ("status", "Print the current task state without modifying the store"),
+            ("run", "Execute one queued task with a real EZKL proof"),
+            ("retry", "Re-queue a failed task whose error is retryable")):
+        command = task_sub.add_parser(name, help=help_text)
+        command.add_argument("--store", required=True, type=Path,
+                             help="Proof-task store directory")
+        command.add_argument("--task-id", required=True, help="Task id (pt-...)")
     return parser
 
 
@@ -106,12 +139,23 @@ def main():
                 result = enable_model(args.registry, args.version)
             else:
                 result = revoke_model(args.registry, args.version)
+        elif args.command == "proof-task":
+            if args.task_command == "create":
+                result = create_task(args.store, args.input, args.model,
+                                     args.setup_dir, args.credential,
+                                     args.idempotency_key)
+            elif args.task_command == "status":
+                result = status_task(args.store, args.task_id)
+            elif args.task_command == "run":
+                result = run_task(args.store, args.task_id)
+            else:
+                result = retry_task(args.store, args.task_id)
         else:
             result = run_verify(args.credential, args.manifest, args.model,
                                args.settings, args.vk, args.srs,
                                args.registry, args.model_version)
         print(json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2))
-    except (ZkError, RegistryError) as error:
+    except (ZkError, RegistryError, ProofTaskError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
     except (ValueError, OSError, RuntimeError) as error:

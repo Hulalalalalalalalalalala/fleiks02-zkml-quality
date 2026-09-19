@@ -178,6 +178,57 @@ two are compared on every verification, so a stale or altered registry record
 cannot point verification at different settings/VK/SRS than the manifest
 pins.
 
+### Proof tasks: an offline prover-side task queue
+
+`proof-task` adds a durable prover-owned task library (`--store`, a local
+directory) on top of `zk-prove`, so proving work can be created, executed,
+inspected and retried as discrete units. Everything stays local and offline.
+
+```sh
+# Record a queued task. Takes exactly the same inputs as zk-prove and
+# validates them up front; the task id is allocated atomically.
+python -m zkml_quality proof-task create --store tasks \
+    --input samples/normal.json --model models/quality.onnx \
+    --setup-dir setup --credential credential.json \
+    --idempotency-key batch-42
+
+python -m zkml_quality proof-task status --store tasks --task-id pt-…
+python -m zkml_quality proof-task run    --store tasks --task-id pt-…
+python -m zkml_quality proof-task retry  --store tasks --task-id pt-…
+```
+
+* **create** validates the input JSON, model, setup directory and credential
+  target exactly as `zk-prove` would and atomically records a `queued` task.
+  With `--idempotency-key`, resubmitting the *identical* request returns the
+  original task; the same key with a different request is a conflict and is
+  rejected.
+* **run** performs the only executor transition: `queued` → `running` →
+  `succeeded`/`failed`. Each run increments `attempt` and records the
+  creation/start/finish timestamps; a per-task executor lock admits a single
+  executor, so a competing `run` fails. Success always means a real EZKL
+  proof was generated and self-verified, and only then is the credential
+  SHA-256 recorded. A failure or interruption never reports success, never
+  overwrites a credential and never drops attempt history.
+* **status** prints the current task without modifying the store.
+* **retry** re-queues a `failed` task whose recorded error is retryable
+  (`artifact_missing`, `ezkl_failure`, `output_io`, `interrupted`); every
+  other state — and non-retryable failures such as `digest_mismatch` — is
+  refused.
+
+Every successful command prints a single JSON object to stdout with
+`task_id`, `state`, `attempt`, the timestamps and `credential_sha256`;
+failed tasks additionally carry `error.code`, `error.retryable` and a
+sanitised `error.message`. Output never contains features, input content,
+proof data or filesystem paths. Failures exit nonzero and write only stderr.
+Error codes distinguish `invalid_request`, `artifact_missing`,
+`digest_mismatch`, `ezkl_failure`, `output_io` and `interrupted`.
+
+The store holds one JSON record per task plus an idempotency index. Records
+are strictly validated on every load; a corrupt store or an illegal state is
+rejected and the original file is left byte-for-byte intact. All updates go
+through a same-directory temporary file and an atomic rename.
+
+
 ### Credential format
 
 `credential.json` is the only artifact exchanged between prover and verifier:
