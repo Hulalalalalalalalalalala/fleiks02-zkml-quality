@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 outputs/
 .pytest_cache/
+# Local zk-setup output (proving keys are large)
+setup/
+*.cred.json
