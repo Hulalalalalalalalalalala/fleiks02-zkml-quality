@@ -28,6 +28,8 @@ def _parser():
 
     verify = sub.add_parser("zk-verify", help="Verify a credential without input, proving key or network")
     verify.add_argument("--credential", required=True, type=Path)
+    verify.add_argument("--manifest", required=True, type=Path,
+                        help="Verifier-obtained manifest.json from zk-setup (trust root)")
     verify.add_argument("--model", required=True, type=Path, help="Verifier-chosen ONNX model")
     verify.add_argument("--settings", required=True, type=Path)
     verify.add_argument("--vk", required=True, type=Path, help="Verification key")
@@ -48,7 +50,8 @@ def main():
         elif args.command == "zk-prove":
             result = run_prove(args.input, args.model, args.setup_dir, args.credential)
         else:
-            result = run_verify(args.credential, args.model, args.settings, args.vk, args.srs)
+            result = run_verify(args.credential, args.manifest, args.model,
+                                args.settings, args.vk, args.srs)
         print(json.dumps(result, ensure_ascii=False, allow_nan=False, indent=2))
     except ZkError as error:
         print(f"error: {error}", file=sys.stderr)

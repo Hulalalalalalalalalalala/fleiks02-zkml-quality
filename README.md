@@ -27,9 +27,11 @@ python -m zkml_quality zk-setup --model models/quality.onnx --dir setup
 python -m zkml_quality zk-prove --input samples/normal.json \
     --model models/quality.onnx --setup-dir setup --credential credential.json
 
-# 3. Verifier: needs only the credential and verifier-chosen model/settings/vk/srs.
-#    No original input, no proving key, no compiled circuit, no network.
+# 3. Verifier: needs only the credential, the zk-setup manifest, and
+#    verifier-chosen model/settings/vk/srs. No original input, no proving key,
+#    no compiled circuit, no network.
 python -m zkml_quality zk-verify --credential credential.json \
+    --manifest setup/manifest.json \
     --model models/quality.onnx --settings setup/settings.json \
     --vk setup/verification.key --srs setup/srs
 ```
@@ -43,8 +45,25 @@ scores from `infer`, which are never presented as proven. Labels follow the
 same rule as `infer`: the larger score wins, a tie is `normal`.
 
 Any tampering or mismatch — proof bytes, public instances, claimed scores or
-label, credential model digest, verifier model, settings, VK, or SRS — exits
-nonzero with a message on stderr and prints no success result.
+label, credential model digest, verifier model, settings, VK, SRS, or the
+manifest itself — exits nonzero with a message on stderr and prints no success
+result.
+
+### Trust boundary
+
+`zk-verify` treats the `--manifest` file (the `manifest.json` written
+atomically by `zk-setup`) as the trust root. The verifier must obtain it
+independently of the credential — e.g. from the setup operator over a
+channel the verifier already trusts. Before any proof is checked, the
+manifest is validated (format version, kind, EZKL version, digest shapes) and
+the verifier's own model, settings, VK and SRS files are hashed and required
+to match it exactly. Only then are the credential's embedded digests compared
+against this manifest-bound material, and the final decision still comes from
+EZKL cryptographic verification. The credential's claims are never a root of
+trust: rewriting `model_sha256` or `verification_artifacts` in the credential,
+swapping in a different ONNX model, or mixing verification material from
+another setup all fail, because none of that can alter the verifier's
+manifest.
 
 ### Credential format
 
@@ -61,8 +80,8 @@ nonzero with a message on stderr and prints no success result.
 | `proof` | The EZKL proof blob including its public instances |
 
 The credential never contains `features`, the input file, or any input path.
-The verifier never trusts the credential's embedded model or parameters: it
-recomputes the model digest from its own ONNX file, recomputes all artifact
-digests from its own settings/VK/SRS, and accepts the result only after EZKL
-cryptographic verification succeeds against those files.
+The verifier never trusts the credential's embedded model or parameters: they
+are accepted only insofar as they agree with the verifier's own manifest-bound
+material (see *Trust boundary* above), and the result is accepted only after
+EZKL cryptographic verification succeeds against those files.
 

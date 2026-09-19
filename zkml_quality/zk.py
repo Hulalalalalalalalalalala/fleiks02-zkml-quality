@@ -7,9 +7,11 @@ Three stages:
 * ``run_prove`` consumes a private six-feature input, generates the witness and
   a real proof, and writes a self-contained JSON credential. Only the two
   quantized output scores are public; the features stay private.
-* ``run_verify`` checks a credential against verifier-supplied model, settings,
-  VK and SRS. It needs neither the original input nor the proving key nor any
-  network access.
+* ``run_verify`` checks a credential against verifier-supplied public material:
+  the ``manifest.json`` produced by ``run_setup`` is the trust root, and the
+  model, settings, VK and SRS must all match it before the proof is checked.
+  It needs neither the original input nor the proving key nor any network
+  access.
 
 The ordinary ONNX floating-point scores are never presented as proven values:
 the credential only carries the quantized scores that are the circuit's public
@@ -60,6 +62,11 @@ def _sha256(path):
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _is_sha256(value):
+    return isinstance(value, str) and len(value) == 64 and all(
+        char in "0123456789abcdef" for char in value)
 
 
 def _require_file(path, description):
@@ -193,11 +200,17 @@ def run_setup(model, setup_dir):
             "output_scale": output_scale}
 
 
-def _load_manifest(setup_dir):
-    manifest_path = _require_file(setup_dir / MANIFEST_NAME, "setup manifest")
+def _load_manifest(manifest_path):
+    """Load and validate a ``zk-setup`` manifest from a verifier-chosen path.
+
+    The manifest is the trust root for verification: it must be obtained by
+    the verifier independently of the credential, and every digest in it must
+    be well-formed before any physical artifact is compared against it.
+    """
+    manifest_path = _require_file(manifest_path, "setup manifest")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
+    except (OSError, json.JSONDecodeError) as error:
         raise ZkError(f"invalid setup manifest JSON: {error}") from error
     if not isinstance(manifest, dict) or manifest.get("kind") != "zk-quality-setup" \
             or manifest.get("format_version") != FORMAT_VERSION:
@@ -206,6 +219,12 @@ def _load_manifest(setup_dir):
         raise ZkError(
             f"setup was produced with EZKL {manifest.get('ezkl_version')}, "
             f"installed EZKL is {ezkl_version()}")
+    if not _is_sha256(manifest.get("model_sha256")):
+        raise ZkError("setup manifest model digest is invalid")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict) or not artifacts \
+            or any(not _is_sha256(digest) for digest in artifacts.values()):
+        raise ZkError("setup manifest artifact digests are invalid")
     return manifest
 
 
@@ -280,7 +299,7 @@ def run_prove(input_path, model, setup_dir, credential_path):
     except ValueError as error:
         raise ZkError(str(error)) from error
 
-    manifest = _load_manifest(setup_dir)
+    manifest = _load_manifest(setup_dir / MANIFEST_NAME)
     model_sha = _sha256(model)
     if model_sha != manifest.get("model_sha256"):
         raise ZkError("model does not match the model this setup was built for")
@@ -376,15 +395,14 @@ def _load_credential(credential_path):
         raise ZkError(
             f"credential was produced with EZKL {credential['ezkl_version']}, "
             f"verifier uses EZKL {ezkl_version()}")
-    if not isinstance(credential["model_sha256"], str) \
-            or len(credential["model_sha256"]) != 64:
+    if not _is_sha256(credential["model_sha256"]):
         raise ZkError("credential model digest is invalid")
     # A credential must never carry the private input.
     if "features" in credential or "input_data" in credential:
         raise ZkError("credential illegally contains private input data")
     artifacts = credential["verification_artifacts"]
     if not isinstance(artifacts, dict) or any(
-            not isinstance(artifacts.get(key), str) or len(artifacts[key]) != 64
+            not _is_sha256(artifacts.get(key))
             for key in ("settings_sha256", "vk_sha256", "srs_sha256")):
         raise ZkError("credential verification-artifact digests are invalid")
     public = credential["public_output"]
@@ -405,32 +423,50 @@ def _load_credential(credential_path):
     return credential
 
 
-def run_verify(credential_path, model, settings_path, vk_path, srs_path):
-    """Verify a credential offline against verifier-chosen public artifacts.
+def run_verify(credential_path, manifest_path, model, settings_path, vk_path, srs_path):
+    """Verify a credential offline against verifier-chosen public material.
 
-    The credential's embedded model hash and parameters are never trusted:
-    the model digest is recomputed from the verifier's own ONNX file, artifact
-    digests are recomputed from the verifier's settings/VK/SRS, and the final
+    The ``zk-setup`` manifest is the trust root: the verifier obtains it
+    independently of the credential, and the model, settings, VK and SRS on
+    disk must all hash to it before anything else is considered. The
+    credential's embedded digests are claims, never roots of trust — they are
+    accepted only insofar as they agree with the manifest, and the final
     decision comes from EZKL cryptographic verification.
     """
     credential = _load_credential(credential_path)
+    manifest = _load_manifest(manifest_path)
     model = _require_file(model, "ONNX model")
     settings_path = _require_file(settings_path, "settings file")
     vk_path = _require_file(vk_path, "verification key")
     srs_path = _require_file(srs_path, "SRS file")
 
+    # Bind every physical artifact to the verifier-endorsed manifest.
     model_sha = _sha256(model)
-    if model_sha != credential["model_sha256"]:
-        raise ZkError("model digest does not match the credential")
+    if model_sha != manifest["model_sha256"]:
+        raise ZkError("model does not match the verifier's setup manifest")
+    manifest_artifacts = manifest["artifacts"]
+    artifact_files = {"settings": settings_path, "vk": vk_path, "srs": srs_path}
+    actual_digests = {}
+    for key, path in artifact_files.items():
+        expected = manifest_artifacts.get(key)
+        if not _is_sha256(expected):
+            raise ZkError(f"setup manifest does not record a valid '{key}' digest")
+        digest = _sha256(path)
+        if digest != expected:
+            raise ZkError(
+                f"verification material '{ARTIFACT_NAMES[key]}' does not match the "
+                f"verifier's setup manifest: {path}")
+        actual_digests[key] = digest
+
+    # The credential's claims must agree with the manifest-bound material;
+    # rewriting them cannot relocate the trust root.
+    if credential["model_sha256"] != manifest["model_sha256"]:
+        raise ZkError("credential model digest does not match the setup manifest")
     claimed = credential["verification_artifacts"]
-    supplied = {
-        "settings_sha256": (_sha256(settings_path), settings_path),
-        "vk_sha256": (_sha256(vk_path), vk_path),
-        "srs_sha256": (_sha256(srs_path), srs_path),
-    }
-    for key, (actual, path) in supplied.items():
-        if actual != claimed[key]:
-            raise ZkError(f"verification artifact mismatch for {key}: {path}")
+    for key, claim_field in (("settings", "settings_sha256"),
+                             ("vk", "vk_sha256"), ("srs", "srs_sha256")):
+        if claimed[claim_field] != actual_digests[key]:
+            raise ZkError(f"credential verification-artifact mismatch for {claim_field}")
 
     try:
         settings_doc = json.loads(Path(settings_path).read_text(encoding="utf-8"))

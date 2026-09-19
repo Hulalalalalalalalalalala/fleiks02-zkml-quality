@@ -1,5 +1,6 @@
 """End-to-end tests for the real EZKL 23.0.5 CPU proof loop."""
 import copy
+import hashlib
 import json
 import shutil
 import tempfile
@@ -31,12 +32,14 @@ class ZkLoopTest(unittest.TestCase):
         cls.model_sha = run_setup(MODEL, cls.setup_dir)["model_sha256"]
 
         # The verifier gets only public artifacts: no proving key, no compiled
-        # circuit, and never the private input.
+        # circuit, and never the private input. The manifest is the verifier's
+        # independently obtained trust root.
         cls.verifier_dir = cls.workspace / "verifier"
         cls.verifier_dir.mkdir()
         shutil.copy(cls.setup_dir / "settings.json", cls.verifier_dir / "settings.json")
         shutil.copy(cls.setup_dir / "verification.key", cls.verifier_dir / "vk")
         shutil.copy(cls.setup_dir / "srs", cls.verifier_dir / "srs")
+        shutil.copy(cls.setup_dir / "manifest.json", cls.verifier_dir / "manifest.json")
         shutil.copy(MODEL, cls.verifier_dir / "model.onnx")
 
     @classmethod
@@ -50,9 +53,10 @@ class ZkLoopTest(unittest.TestCase):
         run_prove(input_path, MODEL, self.setup_dir, credential_path)
         return json.loads(credential_path.read_text(encoding="utf-8")), credential_path
 
-    def _verify(self, credential_path):
+    def _verify(self, credential_path, manifest=None):
         return run_verify(
-            credential_path, self.verifier_dir / "model.onnx",
+            credential_path, manifest or self.verifier_dir / "manifest.json",
+            self.verifier_dir / "model.onnx",
             self.verifier_dir / "settings.json",
             self.verifier_dir / "vk", self.verifier_dir / "srs")
 
@@ -149,9 +153,57 @@ class ZkLoopTest(unittest.TestCase):
         self._write_different_model()
         _, credential_path = self._prove("wrongmodel", [0.125] * 6)
         with self.assertRaises(ZkError):
-            run_verify(credential_path, self.workspace / "other.onnx",
+            run_verify(credential_path, self.verifier_dir / "manifest.json",
+                       self.workspace / "other.onnx",
                        self.verifier_dir / "settings.json",
                        self.verifier_dir / "vk", self.verifier_dir / "srs")
+
+    def test_manifest_is_the_trust_root(self):
+        credential, credential_path = self._prove("trustroot", [0.125] * 6)
+        manifest = json.loads((self.verifier_dir / "manifest.json").read_text(encoding="utf-8"))
+
+        def reject_manifest(mutated, message):
+            bad_path = self.workspace / f"bad-manifest-{message}.json"
+            bad_path.write_text(json.dumps(mutated), encoding="utf-8")
+            with self.assertRaises(ZkError, msg=message):
+                self._verify(credential_path, manifest=bad_path)
+
+        # Missing, malformed and unsupported manifests are rejected.
+        with self.assertRaises(ZkError):
+            self._verify(credential_path, manifest=self.workspace / "no-manifest.json")
+        reject_manifest({**manifest, "kind": "other"}, "kind")
+        reject_manifest({**manifest, "format_version": 999}, "version")
+        reject_manifest({**manifest, "ezkl_version": "0.0.0"}, "ezkl")
+        reject_manifest({**manifest, "model_sha256": "not-a-digest"}, "model-digest")
+        reject_manifest({**manifest, "artifacts": {"settings": "z" * 64}}, "artifact-digest")
+
+        # A manifest that does not match the physical material is rejected.
+        mutated = copy.deepcopy(manifest)
+        mutated["model_sha256"] = "0" * 64
+        reject_manifest(mutated, "model-mismatch")
+        for key in ("settings", "vk", "srs"):
+            mutated = copy.deepcopy(manifest)
+            mutated["artifacts"][key] = "1" * 64
+            reject_manifest(mutated, f"{key}-mismatch")
+
+        # Rewriting the credential's claims to match a swapped-in model and
+        # re-anchored digests cannot relocate the trust root: the verifier's
+        # manifest still pins the original model and artifacts.
+        self._write_different_model()
+        other_sha = hashlib.sha256(
+            (self.workspace / "other.onnx").read_bytes()).hexdigest()
+        mutated = copy.deepcopy(credential)
+        mutated["model_sha256"] = other_sha
+        bad_path = self.workspace / "bad-rewritten-claims.json"
+        bad_path.write_text(json.dumps(mutated), encoding="utf-8")
+        with self.assertRaises(ZkError):
+            run_verify(bad_path, self.verifier_dir / "manifest.json",
+                       self.workspace / "other.onnx",
+                       self.verifier_dir / "settings.json",
+                       self.verifier_dir / "vk", self.verifier_dir / "srs")
+
+        # The genuine manifest and credential still verify.
+        self.assertTrue(self._verify(credential_path)["verified"])
 
     def _write_different_model(self):
         import numpy as np
@@ -201,6 +253,7 @@ class ZkLoopTest(unittest.TestCase):
             run_prove(MODEL, MODEL, self.setup_dir, self.workspace / "never-written.json")
         with self.assertRaises(ZkError):
             run_verify(self.workspace / "missing-credential.json",
+                       self.verifier_dir / "manifest.json",
                        MODEL, self.verifier_dir / "settings.json",
                        self.verifier_dir / "vk", self.verifier_dir / "srs")
 
