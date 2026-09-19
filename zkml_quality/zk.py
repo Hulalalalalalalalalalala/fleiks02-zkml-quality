@@ -3,13 +3,24 @@
 Three stages:
 
 * ``run_setup`` compiles an ONNX model into a circuit and produces settings,
-  proving key, verification key and SRS (offline, CPU).
+  proving key, verification key and SRS (offline, CPU), together with a
+  ``manifest.json`` that pins every public artifact by SHA-256.
 * ``run_prove`` consumes a private six-feature input, generates the witness and
   a real proof, and writes a self-contained JSON credential. Only the two
   quantized output scores are public; the features stay private.
-* ``run_verify`` checks a credential against verifier-supplied model, settings,
-  VK and SRS. It needs neither the original input nor the proving key nor any
-  network access.
+* ``run_verify`` checks a credential against public materials the verifier
+  independently obtained: the setup manifest plus the ONNX model, settings,
+  VK and SRS named by it. It needs neither the original input nor the proving
+  key nor the compiled circuit nor any network access.
+
+Trust model: the verifier's own ``manifest.json`` (obtained through a channel
+the verifier trusts, e.g. produced by their own ``zk-setup`` run) is the single
+root of trust. It pins the format version, credential/setup kind, EZKL version,
+the model digest and the digests of settings, the verification key and the SRS;
+the manifest in turn binds the circuit, because the VK only validates proofs
+for the circuit/settings it was generated for. Nothing embedded in the
+credential is ever treated as authoritative: its digests and parameters are at
+most cross-checked against the manifest and, ultimately, against EZKL.
 
 The ordinary ONNX floating-point scores are never presented as proven values:
 the credential only carries the quantized scores that are the circuit's public
@@ -29,6 +40,7 @@ from .inference import validate_features
 
 FORMAT_VERSION = 1
 CREDENTIAL_KIND = "zk-quality-credential"
+SETUP_KIND = "zk-quality-setup"
 ARTIFACT_NAMES = {
     "compiled": "compiled.ezkl",
     "settings": "settings.json",
@@ -36,11 +48,16 @@ ARTIFACT_NAMES = {
     "vk": "verification.key",
     "srs": "srs",
 }
+# Public verification materials whose digests the manifest pins and that the
+# verifier must hold. The compiled circuit and proving key stay with the prover.
+VERIFICATION_ARTIFACTS = ("settings", "vk", "srs")
 MANIFEST_NAME = "manifest.json"
 
 # Labels follow the existing inference convention: index 0 is "normal",
 # index 1 is "inspect", and a tie resolves to "normal".
 LABELS = ("normal", "inspect")
+
+_HEX64 = set("0123456789abcdef")
 
 
 class ZkError(Exception):
@@ -60,6 +77,10 @@ def _sha256(path):
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _is_sha256_hex(value):
+    return isinstance(value, str) and len(value) == 64 and all(char in _HEX64 for char in value)
 
 
 def _require_file(path, description):
@@ -168,15 +189,19 @@ def run_setup(model, setup_dir):
                 os.replace(parts[key], target)
                 partials.append(target)
 
+            # Hash only after the files are final, then validate the document we
+            # are about to publish so setup can never emit a broken manifest.
+            artifact_digests = {key: _sha256(target) for key, target in targets.items()}
             manifest = {
                 "format_version": FORMAT_VERSION,
-                "kind": "zk-quality-setup",
+                "kind": SETUP_KIND,
                 "ezkl_version": ezkl_version(),
                 "model_sha256": model_sha,
                 "logrows": logrows,
                 "output_scale": output_scale,
-                "artifacts": {key: _sha256(targets[key]) for key in targets},
+                "artifacts": artifact_digests,
             }
+            _validate_manifest_fields(manifest)
             manifest_part = setup_dir / f".{MANIFEST_NAME}.part"
             manifest_part.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
             partials.append(manifest_part)
@@ -193,20 +218,87 @@ def run_setup(model, setup_dir):
             "output_scale": output_scale}
 
 
-def _load_manifest(setup_dir):
-    manifest_path = _require_file(setup_dir / MANIFEST_NAME, "setup manifest")
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise ZkError(f"invalid setup manifest JSON: {error}") from error
-    if not isinstance(manifest, dict) or manifest.get("kind") != "zk-quality-setup" \
-            or manifest.get("format_version") != FORMAT_VERSION:
+def _validate_manifest_fields(manifest):
+    """Shape and field validation shared by the producer and every consumer.
+
+    Every digest must be 64 lowercase hex characters; missing or malformed
+    fields are rejected rather than coerced.
+    """
+    if not isinstance(manifest, dict):
+        raise ZkError("setup manifest must be a JSON object")
+    if manifest.get("format_version") != FORMAT_VERSION:
+        raise ZkError("setup manifest format version is unsupported")
+    if manifest.get("kind") != SETUP_KIND:
         raise ZkError("setup manifest is unsupported or was not produced by zk-setup")
     if manifest.get("ezkl_version") != ezkl_version():
         raise ZkError(
             f"setup was produced with EZKL {manifest.get('ezkl_version')}, "
             f"installed EZKL is {ezkl_version()}")
+    if not _is_sha256_hex(manifest.get("model_sha256")):
+        raise ZkError("setup manifest records an invalid model SHA-256")
+    if not isinstance(manifest.get("logrows"), int) or isinstance(manifest.get("logrows"), bool) \
+            or not 1 <= manifest["logrows"] <= 30:
+        raise ZkError("setup manifest records an invalid logrows value")
+    if not isinstance(manifest.get("output_scale"), int) \
+            or isinstance(manifest.get("output_scale"), bool) or manifest["output_scale"] <= 0:
+        raise ZkError("setup manifest records an invalid output scale")
+    digests = manifest.get("artifacts")
+    if not isinstance(digests, dict):
+        raise ZkError("setup manifest does not record artifact digests")
+    for key in ARTIFACT_NAMES:
+        if not _is_sha256_hex(digests.get(key)):
+            raise ZkError(f"setup manifest records an invalid digest for '{ARTIFACT_NAMES[key]}'")
+    if set(digests) != set(ARTIFACT_NAMES):
+        raise ZkError("setup manifest records an unexpected set of artifacts")
+
+
+def _read_manifest(manifest_path):
+    """Load and strictly validate the verifier's own setup manifest."""
+    manifest_path = _require_file(manifest_path, "setup manifest")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"),
+                              parse_constant=lambda value: (_ for _ in ()).throw(
+                                  ValueError(f"invalid JSON constant {value}")))
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        raise ZkError(f"invalid setup manifest JSON: {error}") from error
+    _validate_manifest_fields(manifest)
     return manifest
+
+
+def load_verifier_materials(manifest_path, model, settings_path, vk_path, srs_path):
+    """Resolve the verifier's trust material against its own manifest.
+
+    The manifest is the root of trust: the ONNX model and each verification
+    artifact must hash to the digest pinned in it. Returns the validated
+    manifest, material paths and the output scale. Nothing here consults a
+    credential.
+    """
+    manifest = _read_manifest(manifest_path)
+    supplied = {
+        "settings": (settings_path, "settings file"),
+        "vk": (vk_path, "verification key"),
+        "srs": (srs_path, "SRS file"),
+    }
+    materials = {
+        "model": (_require_file(model, "ONNX model"), manifest["model_sha256"]),
+    }
+    for key in VERIFICATION_ARTIFACTS:
+        path, description = supplied[key]
+        materials[key] = (
+            _require_file(path, description), manifest["artifacts"][key])
+    for key, (path, expected_digest) in materials.items():
+        actual_digest = _sha256(path)
+        if actual_digest != expected_digest:
+            label = "ONNX model" if key == "model" else ARTIFACT_NAMES[key]
+            raise ZkError(
+                f"{label} does not match the verifier manifest: {path}. "
+                "Use only the public materials pinned by a zk-setup manifest you trust")
+    return {
+        "manifest": manifest,
+        "paths": {key: path for key, (path, _) in materials.items()},
+        "model_sha256": manifest["model_sha256"],
+        "output_scale": int(manifest["output_scale"]),
+    }
 
 
 def _artifact_paths(setup_dir):
@@ -216,11 +308,9 @@ def _artifact_paths(setup_dir):
 
 def _check_artifacts(manifest, paths):
     """Verify every setup artifact on disk still matches the setup manifest."""
-    digests = manifest.get("artifacts")
-    if not isinstance(digests, dict):
-        raise ZkError("setup manifest does not record artifact digests")
-    for key, path in paths.items():
-        if _sha256(path) != digests.get(key):
+    digests = manifest["artifacts"]
+    for key in paths:
+        if _sha256(paths[key]) != digests[key]:
             raise ZkError(
                 f"setup artifact '{ARTIFACT_NAMES[key]}' does not match the setup manifest; "
                 "rerun zk-setup instead of reusing mismatched files")
@@ -280,9 +370,9 @@ def run_prove(input_path, model, setup_dir, credential_path):
     except ValueError as error:
         raise ZkError(str(error)) from error
 
-    manifest = _load_manifest(setup_dir)
+    manifest = _read_manifest(setup_dir / MANIFEST_NAME)
     model_sha = _sha256(model)
-    if model_sha != manifest.get("model_sha256"):
+    if model_sha != manifest["model_sha256"]:
         raise ZkError("model does not match the model this setup was built for")
     paths = _artifact_paths(setup_dir)
     _check_artifacts(manifest, paths)
@@ -376,15 +466,14 @@ def _load_credential(credential_path):
         raise ZkError(
             f"credential was produced with EZKL {credential['ezkl_version']}, "
             f"verifier uses EZKL {ezkl_version()}")
-    if not isinstance(credential["model_sha256"], str) \
-            or len(credential["model_sha256"]) != 64:
+    if not _is_sha256_hex(credential["model_sha256"]):
         raise ZkError("credential model digest is invalid")
     # A credential must never carry the private input.
     if "features" in credential or "input_data" in credential:
         raise ZkError("credential illegally contains private input data")
     artifacts = credential["verification_artifacts"]
     if not isinstance(artifacts, dict) or any(
-            not isinstance(artifacts.get(key), str) or len(artifacts[key]) != 64
+            not _is_sha256_hex(artifacts.get(key))
             for key in ("settings_sha256", "vk_sha256", "srs_sha256")):
         raise ZkError("credential verification-artifact digests are invalid")
     public = credential["public_output"]
@@ -405,52 +494,70 @@ def _load_credential(credential_path):
     return credential
 
 
-def run_verify(credential_path, model, settings_path, vk_path, srs_path):
-    """Verify a credential offline against verifier-chosen public artifacts.
+def run_verify(credential_path, manifest_path, model, settings_path, vk_path, srs_path):
+    """Verify a credential offline against the verifier's own trust material.
 
-    The credential's embedded model hash and parameters are never trusted:
-    the model digest is recomputed from the verifier's own ONNX file, artifact
-    digests are recomputed from the verifier's settings/VK/SRS, and the final
-    decision comes from EZKL cryptographic verification.
+    The verifier's ``manifest.json`` — not the credential — is the root of
+    trust. The model digest and every settings/VK/SRS digest are recomputed
+    from the verifier's files and matched to the manifest first; the matching
+    files then drive EZKL cryptographic verification. Credential-embedded
+    digests and parameters are never authoritative: they are merely required
+    to agree with the manifest, and a proof for a different circuit/key cannot
+    pass EZKL against the pinned VK and settings.
     """
+    # Bind model, circuit (via the VK generated for it) and verification
+    # parameters to the verifier's manifest before touching the credential.
+    materials = load_verifier_materials(
+        manifest_path, model, settings_path, vk_path, srs_path)
+    manifest = materials["manifest"]
+    paths = materials["paths"]
+    model_sha = materials["model_sha256"]
+    scale = materials["output_scale"]
+
     credential = _load_credential(credential_path)
-    model = _require_file(model, "ONNX model")
-    settings_path = _require_file(settings_path, "settings file")
-    vk_path = _require_file(vk_path, "verification key")
-    srs_path = _require_file(srs_path, "SRS file")
 
-    model_sha = _sha256(model)
-    if model_sha != credential["model_sha256"]:
-        raise ZkError("model digest does not match the credential")
+    # Cross-checks against the manifest. These are defence in depth — the
+    # credential values cannot weaken verification because EZKL is driven
+    # solely by the manifest-pinned files — but a credential that claims a
+    # different model or parameters is rejected outright rather than accepted
+    # over a valid proof.
+    if credential["model_sha256"] != model_sha:
+        raise ZkError("credential model digest does not match the verifier manifest")
     claimed = credential["verification_artifacts"]
-    supplied = {
-        "settings_sha256": (_sha256(settings_path), settings_path),
-        "vk_sha256": (_sha256(vk_path), vk_path),
-        "srs_sha256": (_sha256(srs_path), srs_path),
+    expected_artifacts = {
+        "settings_sha256": manifest["artifacts"]["settings"],
+        "vk_sha256": manifest["artifacts"]["vk"],
+        "srs_sha256": manifest["artifacts"]["srs"],
     }
-    for key, (actual, path) in supplied.items():
-        if actual != claimed[key]:
-            raise ZkError(f"verification artifact mismatch for {key}: {path}")
+    for key, expected_digest in expected_artifacts.items():
+        if claimed[key] != expected_digest:
+            raise ZkError(f"credential {key} does not match the verifier manifest")
+    if credential["ezkl_version"] != manifest["ezkl_version"]:
+        raise ZkError("credential EZKL version does not match the verifier manifest")
+    if credential["public_output"]["output_scale"] != scale:
+        raise ZkError("credential output scale does not match the verifier manifest")
 
+    # Independently confirm the pinned settings file really carries the scale
+    # and EZKL version the manifest/credential describe.
     try:
-        settings_doc = json.loads(Path(settings_path).read_text(encoding="utf-8"))
+        settings_doc = json.loads(paths["settings"].read_text(encoding="utf-8"))
         settings_scale = int(settings_doc["model_output_scales"][0])
         settings_version = str(settings_doc["version"])
     except (OSError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as error:
         raise ZkError(f"settings file is unreadable: {error}") from error
-    if settings_version != credential["ezkl_version"]:
+    if settings_version != manifest["ezkl_version"]:
         raise ZkError(
             f"settings were produced with EZKL {settings_version}, "
-            f"credential with EZKL {credential['ezkl_version']}")
-    if settings_scale != credential["public_output"]["output_scale"]:
-        raise ZkError("settings output scale does not match the credential")
+            f"manifest pins EZKL {manifest['ezkl_version']}")
+    if settings_scale != scale:
+        raise ZkError("settings output scale does not match the verifier manifest")
 
     with tempfile.TemporaryDirectory(prefix="zkverify-") as scratch:
         proof_path = Path(scratch) / "proof.pf"
         proof_path.write_text(json.dumps(credential["proof"]), encoding="utf-8")
         with _quiet_stderr():
-            accepted = ezkl.verify(str(proof_path), str(settings_path), str(vk_path),
-                                   str(srs_path), False)
+            accepted = ezkl.verify(str(proof_path), str(paths["settings"]), str(paths["vk"]),
+                                   str(paths["srs"]), False)
         if accepted is not True:
             raise ZkError("proof verification failed")
 

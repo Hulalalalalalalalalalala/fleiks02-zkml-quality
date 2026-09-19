@@ -27,24 +27,78 @@ python -m zkml_quality zk-setup --model models/quality.onnx --dir setup
 python -m zkml_quality zk-prove --input samples/normal.json \
     --model models/quality.onnx --setup-dir setup --credential credential.json
 
-# 3. Verifier: needs only the credential and verifier-chosen model/settings/vk/srs.
-#    No original input, no proving key, no compiled circuit, no network.
+# 3. Verifier: pin model/circuit/parameters with the verifier-owned manifest.
+#    The verifier independently obtains manifest.json from a zk-setup run they
+#    trust (e.g. their own) and the four public files it names. No original
+#    input, no proving key, no compiled circuit, no network.
 python -m zkml_quality zk-verify --credential credential.json \
+    --manifest setup/manifest.json \
     --model models/quality.onnx --settings setup/settings.json \
     --vk setup/verification.key --srs setup/srs
 ```
 
+For example, the verifier can keep their trust material separate from the
+prover's (they never receive `proving.key` or `compiled.ezkl`):
+
+```sh
+mkdir -p verifier
+cp setup/manifest.json setup/settings.json setup/verification.key setup/srs verifier/
+cp models/quality.onnx verifier/model.onnx
+python -m zkml_quality zk-verify --credential credential.json \
+    --manifest verifier/manifest.json --model verifier/model.onnx \
+    --settings verifier/settings.json --vk verifier/vk --srs verifier/srs
+```
+
 On success `zk-verify` prints a single JSON object to stdout containing
 `verified`, the two **quantized scores** (integer field instances and their
-fixed-point decoding), the `label`, and `model_sha256`. The quantized scores
-are what the circuit actually proves (output scale 13 for this model, i.e.
-fixed-point = quantized / 8192); they are not the ordinary ONNX floating-point
-scores from `infer`, which are never presented as proven. Labels follow the
-same rule as `infer`: the larger score wins, a tie is `normal`.
+fixed-point decoding), the `label`, and `model_sha256` — nothing else, and no
+file paths. The quantized scores are what the circuit actually proves (output
+scale 13 for this model, i.e. fixed-point = quantized / 8192); they are not
+the ordinary ONNX floating-point scores from `infer`, which are never
+presented as proven. Labels follow the same rule as `infer`: the larger score
+wins, a tie is `normal`.
 
-Any tampering or mismatch — proof bytes, public instances, claimed scores or
-label, credential model digest, verifier model, settings, VK, or SRS — exits
-nonzero with a message on stderr and prints no success result.
+Any failure — a missing `--manifest` or material file, an illegal/malformed
+manifest field or digest, a mismatch between the manifest's pinned digests and
+the supplied model/settings/VK/SRS, a credential that claims a different model
+or parameters, or proof/instances/public-output tampering — exits nonzero with
+a message on stderr and prints no success JSON.
+
+### Trust boundary: the verifier manifest is the root of trust
+
+`manifest.json` is produced atomically together with the keys by `zk-setup`.
+It pins:
+
+| Manifest field | Pins |
+| --- | --- |
+| `format_version` / `kind` | Format (`1`) and setup kind (`zk-quality-setup`) |
+| `ezkl_version` | The exact EZKL version that generated everything (`23.0.5`) |
+| `model_sha256` | SHA-256 of the ONNX model |
+| `artifacts.settings` | SHA-256 of `settings.json` (circuit shape, scales, visibility) |
+| `artifacts.vk` / `artifacts.srs` | SHA-256 of the verification key and SRS |
+| (`artifacts.compiled` / `artifacts.pk`) | Also pinned for the prover; not needed to verify |
+
+The verifier must obtain `manifest.json` **independently** (typically by running
+`zk-setup` themselves, or over a channel they trust). It must **not** come from
+the prover, from inside the credential, or be regenerated/overwritten from
+credential claims — a prover who controls the root of trust could otherwise
+rewrite the model digest and verification-parameter digests while reusing the
+old proof.
+
+Before any cryptographic check, `zk-verify` first hashes the verifier's own
+model, settings, VK and SRS and requires each digest to equal the value pinned
+in the verifier's manifest, and validates that the manifest's version/kind/
+digests are well-formed. It then cross-checks that the credential's embedded
+digests and output scale agree with the manifest (defence in depth — they can
+never override the manifest), confirms the pinned settings encode the same
+EZKL version and output scale, and finally runs EZKL verification driven
+entirely by the manifest-pinned settings/VK/SRS. The VK was generated for the
+exact compiled circuit and settings, so the manifest simultaneously binds the
+**model** (via `model_sha256`), the **circuit** (via settings + the matching
+VK), and the **verification parameters** (settings/VK/SRS digests), making
+model/settings/VK/SRS mixing impossible. A proof made under another circuit or
+key cannot pass against the pinned VK even if every credential field is forged
+to echo a different trust chain.
 
 ### Credential format
 
@@ -61,8 +115,9 @@ nonzero with a message on stderr and prints no success result.
 | `proof` | The EZKL proof blob including its public instances |
 
 The credential never contains `features`, the input file, or any input path.
-The verifier never trusts the credential's embedded model or parameters: it
-recomputes the model digest from its own ONNX file, recomputes all artifact
-digests from its own settings/VK/SRS, and accepts the result only after EZKL
-cryptographic verification succeeds against those files.
+Its embedded model and parameter digests are **not** a root of trust: they are
+only cross-checked against the verifier's own manifest. The real anchor is
+`--manifest`, which independently pins the model, circuit (via settings and the
+matching VK) and verification parameters; acceptance requires every supplied
+file to match the manifest and EZKL cryptographic verification to succeed.
 
