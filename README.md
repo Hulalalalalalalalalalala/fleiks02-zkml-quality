@@ -15,7 +15,7 @@ The current interface runs ordinary local inference and a two-sample demo. It do
 
 ## Zero-knowledge proofs (EZKL 23.0.5, CPU, offline)
 
-Three additional subcommands run a real proving loop with [EZKL](https://github.com/zkonduit/ezkl) 23.0.5. Input features stay private; only the two circuit outputs are public instances. Nothing is mocked or replaced by digests, and no network is contacted.
+Four additional subcommands run a real proving loop with [EZKL](https://github.com/zkonduit/ezkl) 23.0.5, plus a local model registry that gates verification. Input features stay private; only the two circuit outputs are public instances. Nothing is mocked or replaced by digests, and no network is contacted.
 
 ```sh
 # 1. Compile the circuit and generate settings, SRS, proving and verification keys.
@@ -32,19 +32,29 @@ python -m zkml_quality zk-prove --input samples/normal.json \
 #    trust (e.g. their own) and the four public files it names. No original
 #    input, no proving key, no compiled circuit, no network.
 python -m zkml_quality zk-verify --credential credential.json \
+    --registry verifier/registry.json --model-version v1 \
     --manifest setup/manifest.json \
     --model models/quality.onnx --settings setup/settings.json \
     --vk setup/verification.key --srs setup/srs
 ```
 
-For example, the verifier can keep their trust material separate from the
-prover's (they never receive `proving.key` or `compiled.ezkl`):
+The verifier additionally keeps a **local model registry** (`model-registry`,
+see below) and names an explicitly enabled version on every verification:
 
 ```sh
 mkdir -p verifier
-cp setup/manifest.json setup/settings.json setup/verification.key setup/srs verifier/
+cp setup/manifest.json setup/settings.json verifier/
+cp setup/verification.key verifier/vk
+cp setup/srs verifier/
 cp models/quality.onnx verifier/model.onnx
+
+# Approve and enable the model version out of band; everything is local/offline.
+python -m zkml_quality model-registry register --registry verifier/registry.json \
+    --version v1 --manifest verifier/manifest.json --model verifier/model.onnx
+python -m zkml_quality model-registry enable --registry verifier/registry.json --version v1
+
 python -m zkml_quality zk-verify --credential credential.json \
+    --registry verifier/registry.json --model-version v1 \
     --manifest verifier/manifest.json --model verifier/model.onnx \
     --settings verifier/settings.json --vk verifier/vk --srs verifier/srs
 ```
@@ -58,11 +68,13 @@ the ordinary ONNX floating-point scores from `infer`, which are never
 presented as proven. Labels follow the same rule as `infer`: the larger score
 wins, a tie is `normal`.
 
-Any failure — a missing `--manifest` or material file, an illegal/malformed
-manifest field or digest, a mismatch between the manifest's pinned digests and
-the supplied model/settings/VK/SRS, a credential that claims a different model
-or parameters, or proof/instances/public-output tampering — exits nonzero with
-a message on stderr and prints no success JSON.
+Any failure — a missing `--registry`, `--model-version`, `--manifest` or
+material file, a version that is unregistered, `disabled` or `revoked`, a
+corrupt or structurally illegal registry, a mismatch between the enabled
+registry record and the trusted manifest, a mismatch between the manifest's
+pinned digests and the supplied model/settings/VK/SRS, a credential that
+claims a different model or parameters, or proof/instances/public-output
+tampering — exits nonzero with a message on stderr and prints no success JSON.
 
 ### Trust boundary: the verifier manifest is the root of trust
 
@@ -85,20 +97,86 @@ credential claims — a prover who controls the root of trust could otherwise
 rewrite the model digest and verification-parameter digests while reusing the
 old proof.
 
-Before any cryptographic check, `zk-verify` first hashes the verifier's own
-model, settings, VK and SRS and requires each digest to equal the value pinned
-in the verifier's manifest, and validates that the manifest's version/kind/
-digests are well-formed. It then cross-checks that the credential's embedded
-digests and output scale agree with the manifest (defence in depth — they can
-never override the manifest), confirms the pinned settings encode the same
-EZKL version and output scale, and finally runs EZKL verification driven
-entirely by the manifest-pinned settings/VK/SRS. The VK was generated for the
-exact compiled circuit and settings, so the manifest simultaneously binds the
-**model** (via `model_sha256`), the **circuit** (via settings + the matching
-VK), and the **verification parameters** (settings/VK/SRS digests), making
+Before any cryptographic check, `zk-verify` first requires `--registry` and
+`--model-version` to name a version whose registry status is `enabled` —
+unregistered, `disabled` and `revoked` versions are refused — and requires the
+enabled record to agree with the verifier's own materials (model and manifest
+SHA-256, EZKL version, output scale, settings/VK/SRS digests). It then hashes
+the verifier's own model, settings, VK and SRS and requires each digest to
+equal the value pinned in the verifier's manifest, and validates that the
+manifest's version/kind/digests are well-formed. It then cross-checks that the
+credential's embedded digests and output scale agree with the manifest
+(defence in depth — they can never override the manifest), confirms the
+pinned settings encode the same EZKL version and output scale, and finally
+runs EZKL verification driven entirely by the manifest-pinned
+settings/VK/SRS. The VK was generated for the exact compiled circuit and
+settings, so the manifest simultaneously binds the **model** (via
+`model_sha256`), the **circuit** (via settings + the matching VK), and the
+**verification parameters** (settings/VK/SRS digests), making
 model/settings/VK/SRS mixing impossible. A proof made under another circuit or
 key cannot pass against the pinned VK even if every credential field is forged
-to echo a different trust chain.
+to echo a different trust chain; likewise no credential field can change the
+registry decision, which is made entirely from verifier-owned files.
+
+### Model registry: local, offline admission control
+
+`model-registry` manages a single verifier-owned JSON file (`--registry`); it
+never contacts the network and never modifies any other file. Versions are
+caller-chosen tokens matching `[A-Za-z0-9._-]+` (e.g. `v1`, `2026.09.1`).
+
+```sh
+python -m zkml_quality model-registry register \
+    --registry verifier/registry.json --version v1 \
+    --manifest verifier/manifest.json --model verifier/model.onnx
+python -m zkml_quality model-registry list   --registry verifier/registry.json
+python -m zkml_quality model-registry enable --registry verifier/registry.json --version v1
+python -m zkml_quality model-registry revoke --registry verifier/registry.json --version v1
+```
+
+* **register** validates a manifest/model pair the caller approves: the
+  manifest must be a well-formed `zk-quality-setup` manifest produced by the
+  installed EZKL version, and the ONNX file must hash to the manifest's
+  `model_sha256`. It atomically stores the model and manifest SHA-256, EZKL
+  version, `output_scale` and settings/VK/SRS digests, initially as
+  `disabled`. The registry file (and parent directories) are created if
+  missing. Registering the same version with byte-identical pinned content is
+  a no-op and leaves the current status untouched; any differing content is a
+  conflict and is rejected without overwriting.
+* **list** prints one JSON object with a `models` array ordered by version in
+  lexicographic order.
+* **enable** moves a version from `disabled` to `enabled`; enabling an
+  already-enabled version is a no-op.
+* **revoke** moves any existing version to `revoked`, permanently. Revocation
+  is irreversible: a revoked version can never be enabled or re-registered
+  into a different state, and revoking it again is a no-op.
+
+Every successful update is atomic (temp file + rename); a missing, corrupt or
+structurally illegal registry is rejected and the existing file is preserved
+byte-for-byte. Registry JSON shape:
+
+```json
+{
+  "format_version": 1,
+  "kind": "model-registry",
+  "models": {
+    "v1": {
+      "status": "enabled",
+      "model_sha256": "…",
+      "manifest_sha256": "…",
+      "ezkl_version": "23.0.5",
+      "output_scale": 13,
+      "artifacts": {"settings": "…", "vk": "…", "srs": "…"}
+    }
+  }
+}
+```
+
+The registry belongs to the verifier and is the **admission** layer (which
+approved model versions may be checked at all); the independently obtained
+manifest remains the **root of trust** for the cryptographic material. The
+two are compared on every verification, so a stale or altered registry record
+cannot point verification at different settings/VK/SRS than the manifest
+pins.
 
 ### Credential format
 

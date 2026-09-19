@@ -37,6 +37,7 @@ from pathlib import Path
 import ezkl
 
 from .inference import validate_features
+from .registry import RegistryError, admit_version, require_record_matches
 
 FORMAT_VERSION = 1
 CREDENTIAL_KIND = "zk-quality-credential"
@@ -494,25 +495,43 @@ def _load_credential(credential_path):
     return credential
 
 
-def run_verify(credential_path, manifest_path, model, settings_path, vk_path, srs_path):
+def run_verify(credential_path, manifest_path, model, settings_path, vk_path, srs_path,
+               registry_path, model_version):
     """Verify a credential offline against the verifier's own trust material.
 
-    The verifier's ``manifest.json`` — not the credential — is the root of
-    trust. The model digest and every settings/VK/SRS digest are recomputed
-    from the verifier's files and matched to the manifest first; the matching
-    files then drive EZKL cryptographic verification. Credential-embedded
-    digests and parameters are never authoritative: they are merely required
-    to agree with the manifest, and a proof for a different circuit/key cannot
-    pass EZKL against the pinned VK and settings.
+    Before any cryptographic check the verifier's local model registry must
+    admit ``model_version`` (registered and ``enabled``) and the admitted
+    record must agree, field by field, with the verifier's own trusted
+    manifest: model and manifest SHA-256, EZKL version, output scale and the
+    settings/VK/SRS digests. Unknown, disabled, revoked or mismatching
+    versions, and a corrupt registry, are all refused.
+
+    The verifier's ``manifest.json`` — not the credential and not the registry
+    record — stays the root of trust. The model digest and every
+    settings/VK/SRS digest are recomputed from the verifier's files and matched
+    to the manifest first; the matching files then drive EZKL cryptographic
+    verification. Credential-embedded digests and parameters are never
+    authoritative: they are merely required to agree with the manifest, and a
+    proof for a different circuit/key cannot pass EZKL against the pinned VK
+    and settings.
     """
+    # Registry gate first: before hashing anything or touching the credential,
+    # only an explicitly enabled version in a valid verifier-owned registry
+    # may be verified at all. A missing/corrupt registry or an unknown,
+    # disabled or revoked version stops verification here.
+    record = admit_version(registry_path, model_version)
+
     # Bind model, circuit (via the VK generated for it) and verification
-    # parameters to the verifier's manifest before touching the credential.
+    # parameters to the verifier's manifest, then compare the admitted record
+    # against it field by field. Both consult only verifier-owned files;
+    # nothing in the credential can affect either decision.
     materials = load_verifier_materials(
         manifest_path, model, settings_path, vk_path, srs_path)
     manifest = materials["manifest"]
     paths = materials["paths"]
     model_sha = materials["model_sha256"]
     scale = materials["output_scale"]
+    require_record_matches(record, manifest_sha=_sha256(manifest_path), manifest=manifest)
 
     credential = _load_credential(credential_path)
 

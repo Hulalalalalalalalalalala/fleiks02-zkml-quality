@@ -10,6 +10,13 @@ import unittest
 from pathlib import Path
 
 from zkml_quality.inference import ROOT, infer
+from zkml_quality.registry import (
+    STATUS_DISABLED,
+    RegistryError,
+    enable_model,
+    register_model,
+    revoke_model,
+)
 from zkml_quality.zk import (
     LABELS,
     ZkError,
@@ -20,6 +27,7 @@ from zkml_quality.zk import (
 
 MODEL = ROOT / "models" / "quality.onnx"
 SCALE = 13
+VERSION = "v1.0"
 
 
 def features_document(values):
@@ -47,6 +55,14 @@ class ZkLoopTest(unittest.TestCase):
         shutil.copy(cls.setup_dir / "srs", cls.verifier_dir / "srs")
         shutil.copy(MODEL, cls.verifier_dir / "model.onnx")
 
+        # The verifier's own offline registry: the model starts disabled and is
+        # enabled explicitly before verification. zk-verify only admits enabled
+        # records; revoked/disabled versions are refused.
+        cls.registry = cls.workspace / "registry.json"
+        register_model(cls.registry, VERSION,
+                       cls.verifier_dir / "manifest.json", cls.verifier_dir / "model.onnx")
+        enable_model(cls.registry, VERSION)
+
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.workspace, ignore_errors=True)
@@ -58,7 +74,8 @@ class ZkLoopTest(unittest.TestCase):
         run_prove(input_path, MODEL, self.setup_dir, credential_path)
         return json.loads(credential_path.read_text(encoding="utf-8")), credential_path
 
-    def _verify(self, credential_path, manifest_path=None, **overrides):
+    def _verify(self, credential_path, manifest_path=None, *,
+                registry=None, version=VERSION, **overrides):
         materials = {
             "model": self.verifier_dir / "model.onnx",
             "settings": self.verifier_dir / "settings.json",
@@ -69,7 +86,9 @@ class ZkLoopTest(unittest.TestCase):
         return run_verify(
             credential_path,
             self.verifier_dir / "manifest.json" if manifest_path is None else manifest_path,
-            materials["model"], materials["settings"], materials["vk"], materials["srs"])
+            materials["model"], materials["settings"], materials["vk"], materials["srs"],
+            self.registry if registry is None else registry,
+            version)
 
     def _write_different_model(self, name="other.onnx"):
         import onnx
@@ -308,9 +327,10 @@ class ZkLoopTest(unittest.TestCase):
                         vk=evil / "vk", srs=evil / "srs")
 
         # A semantically altered settings file whose digest is echoed into the
-        # manifest cannot be legitimized: the pinned output scale no longer
-        # matches what the swapped settings encode (and the proof cannot verify
-        # against the unchanged VK anyway).
+        # manifest cannot be legitimized: the enabled registry record pins the
+        # original manifest (its digest no longer matches), and even past that
+        # the pinned output scale disagrees with the swapped settings (and the
+        # proof cannot verify against the unchanged VK anyway).
         evil = self._evil_copy("evil-settings")
         swapped = evil / "settings.json"
         settings_doc = json.loads(swapped.read_text(encoding="utf-8"))
@@ -319,7 +339,7 @@ class ZkLoopTest(unittest.TestCase):
         doc = json.loads((evil / "manifest.json").read_text(encoding="utf-8"))
         doc["artifacts"]["settings"] = hashlib.sha256(swapped.read_bytes()).hexdigest()
         (evil / "manifest.json").write_text(json.dumps(doc), encoding="utf-8")
-        with self.assertRaises(ZkError):
+        with self.assertRaises((ZkError, RegistryError)):
             self._verify(credential_path, manifest_path=evil / "manifest.json",
                         model=evil / "model.onnx", settings=evil / "settings.json",
                         vk=evil / "vk", srs=evil / "srs")
@@ -356,18 +376,23 @@ class ZkLoopTest(unittest.TestCase):
         with self.assertRaises(ZkError):
             self._verify(credential_path, srs=other_setup / "srs")
         # Foreign manifest + the whole foreign material set against the
-        # original credential: the credential's model/artifact digests do not
-        # match, and even forging them cannot make the original proof verify
-        # against the foreign VK.
-        with self.assertRaises(ZkError):
+        # original credential: the honest enabled registry record pins the
+        # honest manifest, so the gate refuses the foreign materials; even the
+        # credential's own digests do not match either.
+        with self.assertRaises((ZkError, RegistryError)):
             self._verify(
                 credential_path, manifest_path=other_setup / "manifest.json",
                 model=other, settings=other_setup / "settings.json",
                 vk=other_setup / "verification.key", srs=other_setup / "srs")
 
-        # Forge every credential field to agree with the foreign manifest, but
-        # keep the proof that was produced under the original circuit. All
-        # manifest cross-checks now pass; the foreign VK must still reject it.
+        # Forge every credential field to agree with the foreign chain, and
+        # admit that chain through an enabled registry record that matches the
+        # foreign manifest. All static cross-checks now pass; the foreign VK
+        # must still reject a proof produced under the original circuit.
+        foreign_registry = self.workspace / "foreign-registry.json"
+        register_model(foreign_registry, "other",
+                       other_setup / "manifest.json", other)
+        enable_model(foreign_registry, "other")
         other_manifest = json.loads(
             (other_setup / "manifest.json").read_text(encoding="utf-8"))
         original = json.loads(credential_path.read_text(encoding="utf-8"))
@@ -388,7 +413,8 @@ class ZkLoopTest(unittest.TestCase):
             self._verify(
                 forged_path, manifest_path=other_setup / "manifest.json",
                 model=other, settings=other_setup / "settings.json",
-                vk=other_setup / "verification.key", srs=other_setup / "srs")
+                vk=other_setup / "verification.key", srs=other_setup / "srs",
+                registry=foreign_registry, version="other")
 
     def test_cli_failure_prints_only_stderr_and_nonzero(self):
         _, credential_path = self._prove("clitamper", [0.125] * 6)
@@ -400,6 +426,7 @@ class ZkLoopTest(unittest.TestCase):
         proc = subprocess.run(
             [sys.executable, "-m", "zkml_quality", "zk-verify",
              "--credential", str(bad),
+             "--registry", str(self.registry), "--model-version", VERSION,
              "--manifest", str(self.verifier_dir / "manifest.json"),
              "--model", str(self.verifier_dir / "model.onnx"),
              "--settings", str(self.verifier_dir / "settings.json"),
@@ -410,10 +437,12 @@ class ZkLoopTest(unittest.TestCase):
         self.assertEqual(proc.stdout, "")
         self.assertIn("error:", proc.stderr)
 
-        # --manifest is mandatory: omitting it fails without running verify.
+        # --registry is mandatory: omitting it fails without running verify.
         proc = subprocess.run(
             [sys.executable, "-m", "zkml_quality", "zk-verify",
              "--credential", str(bad),
+             "--model-version", VERSION,
+             "--manifest", str(self.verifier_dir / "manifest.json"),
              "--model", str(self.verifier_dir / "model.onnx"),
              "--settings", str(self.verifier_dir / "settings.json"),
              "--vk", str(self.verifier_dir / "vk"),
@@ -421,13 +450,29 @@ class ZkLoopTest(unittest.TestCase):
             cwd=str(ROOT), capture_output=True, text=True)
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout, "")
-        self.assertIn("--manifest", proc.stderr)
+        self.assertIn("--registry", proc.stderr)
+
+        # --model-version is mandatory too.
+        proc = subprocess.run(
+            [sys.executable, "-m", "zkml_quality", "zk-verify",
+             "--credential", str(bad),
+             "--registry", str(self.registry),
+             "--manifest", str(self.verifier_dir / "manifest.json"),
+             "--model", str(self.verifier_dir / "model.onnx"),
+             "--settings", str(self.verifier_dir / "settings.json"),
+             "--vk", str(self.verifier_dir / "vk"),
+             "--srs", str(self.verifier_dir / "srs")],
+            cwd=str(ROOT), capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("--model-version", proc.stderr)
 
     def test_cli_success_prints_single_json(self):
         _, credential_path = self._prove("cligood", [0.125] * 6)
         proc = subprocess.run(
             [sys.executable, "-m", "zkml_quality", "zk-verify",
              "--credential", str(credential_path),
+             "--registry", str(self.registry), "--model-version", VERSION,
              "--manifest", str(self.verifier_dir / "manifest.json"),
              "--model", str(self.verifier_dir / "model.onnx"),
              "--settings", str(self.verifier_dir / "settings.json"),
@@ -461,7 +506,8 @@ class ZkLoopTest(unittest.TestCase):
             run_verify(self.workspace / "missing-credential.json",
                        self.verifier_dir / "manifest.json",
                        MODEL, self.verifier_dir / "settings.json",
-                       self.verifier_dir / "vk", self.verifier_dir / "srs")
+                       self.verifier_dir / "vk", self.verifier_dir / "srs",
+                       self.registry, VERSION)
         for missing in ("model.onnx", "settings.json", "vk", "srs"):
             with self.assertRaises(ZkError):
                 run_verify(
@@ -474,7 +520,199 @@ class ZkLoopTest(unittest.TestCase):
                     self.workspace / "missing-vk" if missing == "vk"
                     else self.verifier_dir / "vk",
                     self.workspace / "missing-srs" if missing == "srs"
-                    else self.verifier_dir / "srs")
+                    else self.verifier_dir / "srs",
+                    self.registry, VERSION)
+
+    def test_registry_gate_admits_only_enabled_matching_versions(self):
+        _, credential_path = self._prove("gate", [0.125] * 6)
+
+        # A registry that does not exist, an unknown version, and a bad version
+        # token are all refused before the credential matters.
+        with self.assertRaises(RegistryError):
+            self._verify(credential_path,
+                         registry=self.workspace / "no-registry.json")
+        with self.assertRaises(RegistryError):
+            self._verify(credential_path, version="not-registered")
+        with self.assertRaises(RegistryError):
+            self._verify(credential_path, version="bad version!")
+        with self.assertRaises(RegistryError):
+            self._verify(credential_path, version="")
+
+        # Disabled versions are refused.
+        disabled_reg = self.workspace / "registry-disabled.json"
+        register_model(disabled_reg, "d1",
+                       self.verifier_dir / "manifest.json",
+                       self.verifier_dir / "model.onnx")
+        with self.assertRaises(RegistryError):
+            self._verify(credential_path, registry=disabled_reg, version="d1")
+
+        # Revocation is irreversible: revoked records stay refused and cannot
+        # be re-enabled.
+        revoked_reg = self.workspace / "registry-revoked.json"
+        register_model(revoked_reg, "r1",
+                       self.verifier_dir / "manifest.json",
+                       self.verifier_dir / "model.onnx")
+        enable_model(revoked_reg, "r1")
+        revoke_model(revoked_reg, "r1")
+        with self.assertRaises(RegistryError):
+            self._verify(credential_path, registry=revoked_reg, version="r1")
+        with self.assertRaises(RegistryError):
+            enable_model(revoked_reg, "r1")
+        # Re-registering the revoked version with identical content is a
+        # no-op (same version/same content stays idempotent) and cannot revive
+        # it; different content is a conflict.
+        result = register_model(revoked_reg, "r1",
+                                self.verifier_dir / "manifest.json",
+                                self.verifier_dir / "model.onnx")
+        self.assertEqual(result["status"], "revoked")
+        self.assertFalse(result["changed"])
+        with self.assertRaises(RegistryError):
+            self._verify(credential_path, registry=revoked_reg, version="r1")
+
+        # The enabled honest record still verifies.
+        self.assertTrue(self._verify(credential_path)["verified"])
+
+    def test_corrupt_or_illegal_registry_is_rejected_and_preserved(self):
+        _, credential_path = self._prove("badreg", [0.125] * 6)
+        bad = self.workspace / "registry-corrupt.json"
+
+        def reject_raw(payload):
+            bad.write_text(payload, encoding="utf-8")
+            original = bad.read_bytes()
+            with self.assertRaises(RegistryError):
+                self._verify(credential_path, registry=bad)
+            # A failed read/gate never rewrites the file.
+            self.assertEqual(bad.read_bytes(), original)
+
+        reject_raw("{not json")
+        reject_raw(json.dumps(["not", "an", "object"]))
+        reject_raw('{"format_version": 1, "kind": "model-registry", "models": {"v": {}}}')
+        reject_raw(json.dumps({"format_version": 2, "kind": "model-registry",
+                               "models": {}}))
+        reject_raw(json.dumps({"format_version": 1, "kind": "other", "models": {}}))
+        reject_raw('{"format_version": 1, "kind": "model-registry", "models": {"v": 1}}')
+
+        # Well-formed record with a bad version key or field.
+        good_record = self._honest_record()
+        reject_raw(json.dumps({"format_version": 1, "kind": "model-registry",
+                               "models": {"bad version!": good_record}}))
+        bad_status = copy.deepcopy(good_record)
+        bad_status["status"] = "archived"
+        reject_raw(json.dumps({"format_version": 1, "kind": "model-registry",
+                               "models": {"v2": bad_status}}))
+        bad_digest = copy.deepcopy(good_record)
+        bad_digest["model_sha256"] = "z" * 64
+        reject_raw(json.dumps({"format_version": 1, "kind": "model-registry",
+                               "models": {"v2": bad_digest}}))
+
+        # Explicit duplicate JSON keys are corrupt too.
+        bad.write_text(
+            '{"format_version": 1, "kind": "model-registry",'
+            ' "models": {}, "models": {}}', encoding="utf-8")
+        with self.assertRaises(RegistryError):
+            self._verify(credential_path, registry=bad)
+
+        self.assertTrue(self._verify(credential_path)["verified"])
+
+    def _honest_record(self):
+        manifest = json.loads(
+            (self.verifier_dir / "manifest.json").read_text(encoding="utf-8"))
+        return {
+            "status": STATUS_DISABLED,
+            "model_sha256": manifest["model_sha256"],
+            "manifest_sha256": hashlib.sha256(
+                (self.verifier_dir / "manifest.json").read_bytes()).hexdigest(),
+            "ezkl_version": manifest["ezkl_version"],
+            "output_scale": manifest["output_scale"],
+            "artifacts": {key: manifest["artifacts"][key] for key in ("settings", "vk", "srs")},
+        }
+
+    def test_registry_record_mismatching_materials_is_rejected(self):
+        _, credential_path = self._prove("regmismatch", [0.125] * 6)
+        honest = self._honest_record()
+        other_setup = self._write_other_setup("setup-reg-mismatch")
+        other_manifest = json.loads(
+            (other_setup / "manifest.json").read_text(encoding="utf-8"))
+
+        def registry_with(record, version="m1", status="enabled"):
+            record = copy.deepcopy(record)
+            record["status"] = status
+            path = self.workspace / f"reg-{version}-{record['model_sha256'][:8]}.json"
+            path.write_text(json.dumps(
+                {"format_version": 1, "kind": "model-registry",
+                 "models": {version: record}}), encoding="utf-8")
+            return path, version
+
+        # An enabled record that pins a different model/manifest/parameters
+        # than the verifier's trusted materials is rejected even though it is
+        # syntactically valid and enabled. Credential content cannot fix this:
+        # the gate runs against verifier-owned files only.
+        foreign = {
+            "model_sha256": other_manifest["model_sha256"],
+            "manifest_sha256": hashlib.sha256(
+                (other_setup / "manifest.json").read_bytes()).hexdigest(),
+            "ezkl_version": other_manifest["ezkl_version"],
+            "output_scale": other_manifest["output_scale"],
+            "artifacts": {key: other_manifest["artifacts"][key]
+                          for key in ("settings", "vk", "srs")},
+        }
+        path, version = registry_with(foreign)
+        with self.assertRaises(RegistryError):
+            self._verify(credential_path, registry=path, version=version)
+
+        for field, value in (
+                ("model_sha256", "0" * 64),
+                ("manifest_sha256", "1" * 64),
+                ("ezkl_version", "9.9.9"),
+                ("output_scale", honest["output_scale"] + 1)):
+            mutated = copy.deepcopy(honest)
+            mutated[field] = value
+            path, version = registry_with(mutated)
+            with self.assertRaises(RegistryError):
+                self._verify(credential_path, registry=path, version=version)
+
+        for key in ("settings", "vk", "srs"):
+            mutated = copy.deepcopy(honest)
+            mutated["artifacts"][key] = "f" * 64
+            path, version = registry_with(mutated, version=f"m-{key}")
+            with self.assertRaises(RegistryError):
+                self._verify(credential_path, registry=path, version=version)
+
+        self.assertTrue(self._verify(credential_path)["verified"])
+
+    def _write_other_setup(self, name="setup-reg-other"):
+        other = self._write_different_model(f"other-{name}.onnx")
+        other_setup = self.workspace / name
+        run_setup(other, other_setup)
+        return other_setup
+
+    def test_credential_cannot_change_registry_decision(self):
+        # Forging credential fields to echo different trust material changes
+        # nothing: the admission decision and the pinned material are taken
+        # solely from verifier-owned registry/manifest files, so a credential
+        # that disagrees is simply rejected.
+        _, credential_path = self._prove("regcred", [0.125] * 6)
+        original = json.loads(credential_path.read_text(encoding="utf-8"))
+        self.assertTrue(self._verify(credential_path)["verified"])
+
+        forged = copy.deepcopy(original)
+        forged["model_sha256"] = "0" * 64
+        forged_path = self.workspace / "forged-reg-credential.json"
+        forged_path.write_text(json.dumps(forged), encoding="utf-8")
+        with self.assertRaises(ZkError):
+            self._verify(forged_path)
+
+        # Disabling admission also rejects the perfectly valid original
+        # credential; its contents cannot re-open the gate.
+        from zkml_quality.registry import revoke_model
+        revoked_reg = self.workspace / "registry-gate-revoked.json"
+        register_model(revoked_reg, "g1",
+                       self.verifier_dir / "manifest.json",
+                       self.verifier_dir / "model.onnx")
+        enable_model(revoked_reg, "g1")
+        revoke_model(revoked_reg, "g1")
+        with self.assertRaises(RegistryError):
+            self._verify(credential_path, registry=revoked_reg, version="g1")
 
     def test_setup_refuses_nonempty_directory(self):
         occupied = self.workspace / "occupied"
