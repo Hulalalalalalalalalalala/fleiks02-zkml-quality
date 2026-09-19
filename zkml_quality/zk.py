@@ -32,6 +32,7 @@ import importlib.metadata
 import json
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 import ezkl
@@ -115,30 +116,59 @@ def _require_file(path, description):
     return path
 
 
+_QUIET_STDERR_LOCK = threading.Lock()
+_QUIET_STDERR_STATE = None  # {"capture": file, "saved": fd, "count": int}
+
+
+def _release_quiet_stderr():
+    """Drop one reference to the shared stderr redirection.
+
+    Only the last leaver restores the original descriptor and drains the
+    captured output, so concurrent provers can never strand fd 2 on a closed
+    capture file.
+    """
+    global _QUIET_STDERR_STATE
+    with _QUIET_STDERR_LOCK:
+        state = _QUIET_STDERR_STATE
+        state["count"] -= 1
+        if state["count"] > 0:
+            return None
+        _QUIET_STDERR_STATE = None
+        os.dup2(state["saved"], 2)
+        os.close(state["saved"])
+        capture = state["capture"]
+        capture.seek(0)
+        tail = capture.read().decode("utf-8", "replace").strip().splitlines()
+        capture.close()
+        return tail[-1].strip() if tail else None
+
+
 @contextlib.contextmanager
 def _quiet_stderr():
     """Redirect fd-level stderr (EZKL writes via Rust, bypassing Python).
 
     Captured output is attached to the raised error so EZKL's own diagnostic
-    is still surfaced on failure.
+    is still surfaced on failure. Concurrent users (e.g. a batch run with
+    several workers) share one redirection; the last leaver restores stderr.
     """
-    captured = tempfile.TemporaryFile(mode="w+b")
-    saved = os.dup(2)
+    global _QUIET_STDERR_STATE
+    with _QUIET_STDERR_LOCK:
+        if _QUIET_STDERR_STATE is None:
+            captured = tempfile.TemporaryFile(mode="w+b")
+            saved = os.dup(2)
+            os.dup2(captured.fileno(), 2)
+            _QUIET_STDERR_STATE = {"capture": captured, "saved": saved, "count": 1}
+        else:
+            _QUIET_STDERR_STATE["count"] += 1
     try:
-        os.dup2(captured.fileno(), 2)
         yield
     except Exception as error:
-        os.dup2(saved, 2)
-        captured.seek(0)
-        tail = captured.read().decode("utf-8", "replace").strip().splitlines()
-        detail = tail[-1].strip() if tail else str(error)
+        detail = _release_quiet_stderr()
         if isinstance(error, ZkError):
             raise
-        raise ZkEzklError(f"EZKL failed: {detail}") from error
-    finally:
-        os.dup2(saved, 2)
-        os.close(saved)
-        captured.close()
+        raise ZkEzklError(f"EZKL failed: {detail if detail is not None else error}") from error
+    else:
+        _release_quiet_stderr()
 
 
 def _calibration_rows():
@@ -515,6 +545,8 @@ def _write_credential(credential, credential_path):
     try:
         json.dump(credential, handle, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
         handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
         handle.close()
         os.replace(handle.name, credential_path)
     except BaseException:

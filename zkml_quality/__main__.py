@@ -15,9 +15,12 @@ from .tasks import (
     SAFE_MESSAGES,
     TaskAttemptFailed,
     TaskError,
+    create_batch,
     create_task,
     retry_task,
+    run_batch,
     run_task,
+    status_batch,
     status_task,
 )
 from .zk import ZkError, run_prove, run_setup, run_verify
@@ -93,7 +96,8 @@ def _parser():
 
     proof_task = sub.add_parser(
         "proof-task",
-        help="Manage durable prover tasks (create/status/run/retry) in a local task store")
+        help="Manage durable prover tasks (create/status/run/retry and "
+             "batch-create/batch-status/batch-run) in a local task store")
     task_sub = proof_task.add_subparsers(dest="task_command", required=True)
 
     def add_store(target):
@@ -133,6 +137,36 @@ def _parser():
         "retry", help="Re-queue a failed retryable task")
     add_store(task_retry)
     task_retry.add_argument("--task-id", required=True)
+
+    task_batch_create = task_sub.add_parser(
+        "batch-create",
+        help="Atomically create a whole batch of queued proof tasks from a "
+             "JSON file, or nothing at all")
+    add_store(task_batch_create)
+    task_batch_create.add_argument(
+        "--file", required=True, type=Path,
+        help='JSON file {"items": [{"input", "model", "setup_dir", "credential", '
+             '"idempotency_key"?}, ...]}; relative paths resolve against the '
+             "calling directory")
+    task_batch_create.add_argument(
+        "--max-queued",
+        help="non-negative integer cap on the total number of queued tasks in "
+             "the store; a batch that would exceed it is rejected with "
+             "capacity_exceeded and nothing is written")
+
+    task_batch_status = task_sub.add_parser(
+        "batch-status", help="Show one batch's total, four-state counts and task views")
+    add_store(task_batch_status)
+    task_batch_status.add_argument("--batch-id", required=True)
+
+    task_batch_run = task_sub.add_parser(
+        "batch-run",
+        help="Claim and run the queued tasks of one batch with bounded concurrency")
+    add_store(task_batch_run)
+    task_batch_run.add_argument("--batch-id", required=True)
+    task_batch_run.add_argument(
+        "--max-workers", default="1",
+        help="positive integer concurrency limit for this batch run (default 1)")
     return parser
 
 
@@ -172,6 +206,29 @@ def _task_view_payload(view):
     }
 
 
+def _load_batch_file(path):
+    """Read the batch-create JSON document; any defect is an invalid request."""
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise TaskError("invalid_request") from None
+    if not isinstance(document, dict) or set(document) != {"items"}:
+        raise TaskError("invalid_request")
+    return document["items"]
+
+
+def _parse_count_option(value, *, minimum):
+    """Parse a numeric CLI option; anything but a plain integer is rejected."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.isascii() or not value.isdigit():
+        raise TaskError("invalid_request")
+    result = int(value)
+    if result < minimum:
+        raise TaskError("invalid_request")
+    return result
+
+
 def main():
     args = _parser().parse_args()
     try:
@@ -203,12 +260,24 @@ def main():
                     view, _created = create_task(
                         args.store, args.input, args.model,
                         args.setup_dir, args.credential, args.idempotency_key)
+                    result = _task_view_payload(view)
                 elif args.task_command == "status":
-                    view = status_task(args.store, args.task_id)
+                    result = _task_view_payload(status_task(args.store, args.task_id))
                 elif args.task_command == "run":
-                    view = run_task(args.store, args.task_id)
+                    result = _task_view_payload(run_task(args.store, args.task_id))
+                elif args.task_command == "retry":
+                    result = _task_view_payload(retry_task(args.store, args.task_id))
+                elif args.task_command == "batch-create":
+                    view, _created = create_batch(
+                        args.store, _load_batch_file(args.file),
+                        _parse_count_option(args.max_queued, minimum=0))
+                    result = view
+                elif args.task_command == "batch-status":
+                    result = status_batch(args.store, args.batch_id)
                 else:
-                    view = retry_task(args.store, args.task_id)
+                    result = run_batch(
+                        args.store, args.batch_id,
+                        _parse_count_option(args.max_workers, minimum=1))
             except TaskAttemptFailed as error:
                 # The attempt was recorded as failed; the command fails and
                 # emits one stderr JSON with the post-transition task state.
@@ -220,7 +289,6 @@ def main():
             except Exception:  # noqa: BLE001 - safety net, message is generic
                 _print_error(RuntimeError("internal error"))
                 return 2
-            result = _task_view_payload(view)
         else:
             result = run_verify(args.credential, args.manifest, args.model,
                                args.settings, args.vk, args.srs,

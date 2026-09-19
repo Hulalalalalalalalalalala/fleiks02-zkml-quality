@@ -24,6 +24,7 @@ SHA-256 of the credential it produced, never the credential itself. Paths are
 held in the on-disk job request because the (local, offline) worker needs them
 to perform the deferred proof; they never appear in any command's output.
 """
+import concurrent.futures
 import contextlib
 import fcntl
 import hashlib
@@ -72,6 +73,8 @@ CODE_TASK_NOT_FOUND = "task_not_found"
 CODE_INVALID_STATE = "invalid_state"
 CODE_CONFLICT = "conflict"
 CODE_IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+CODE_CAPACITY_EXCEEDED = "capacity_exceeded"
+CODE_BATCH_NOT_FOUND = "batch_not_found"
 CODE_STORE_CORRUPT = "store_corrupt"
 CODE_STORE_IO = "store_io"
 
@@ -89,6 +92,8 @@ SAFE_MESSAGES = {
     CODE_INVALID_STATE: "the task is not in a state that allows this operation",
     CODE_CONFLICT: "another executor already holds the task",
     CODE_IDEMPOTENCY_CONFLICT: "the idempotency key is already used by a different request",
+    CODE_CAPACITY_EXCEEDED: "the batch would exceed the store's queued-task capacity",
+    CODE_BATCH_NOT_FOUND: "no batch with this id exists in the store",
     CODE_STORE_CORRUPT: "the task store is corrupt or in an illegal state",
     CODE_STORE_IO: "the task store could not be read or written",
 }
@@ -107,6 +112,7 @@ RETRYABLE = {
 
 _HEX64 = set("0123456789abcdef")
 _TASK_ID_RE = re.compile(r"pt-[0-9a-f]{24}")
+_BATCH_ID_RE = re.compile(r"pb-[0-9a-f]{24}")
 _TS_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z")
 
 _SETUP_REQUEST_KEYS = {"ezkl_version", "logrows", "output_scale", "manifest_sha256", "artifacts"}
@@ -124,19 +130,30 @@ _ATTEMPT_KEYS = {
     "retryable", "error_code", "credential_sha256",
 }
 _SETUP_ARTIFACT_KEYS = {"compiled", "settings", "pk", "vk", "srs"}
+_BATCH_KEYS = {"batch_id", "created_at", "task_ids"}
+_BATCH_ITEM_REQUIRED = {"input", "model", "setup_dir", "credential"}
+_BATCH_ITEM_OPTIONAL = {"idempotency_key"}
+_DOCUMENT_REQUIRED = {"format_version", "kind", "tasks"}
+_DOCUMENT_KEYS = _DOCUMENT_REQUIRED | {"batches"}
 
 
 class TaskError(Exception):
-    """Base class for task-store failures; carries a stable error code."""
+    """Base class for task-store failures; carries a stable error code.
+
+    ``retryable`` defaults to the class attribute, so categories that are
+    always retryable (``store_io``) stay retryable even when raised without
+    an explicit flag.
+    """
 
     code = CODE_INVALID_REQUEST
     retryable = False
 
-    def __init__(self, code=None, retryable=False):
+    def __init__(self, code=None, retryable=None):
         super().__init__(SAFE_MESSAGES[code or self.code])
         if code is not None:
             self.code = code
-        self.retryable = retryable
+        if retryable is not None:
+            self.retryable = retryable
 
 
 class TaskAttemptFailed(TaskError):
@@ -161,6 +178,14 @@ class TaskConflict(TaskError):
 
 class TaskIdempotencyConflict(TaskError):
     code = CODE_IDEMPOTENCY_CONFLICT
+
+
+class TaskCapacityExceeded(TaskError):
+    code = CODE_CAPACITY_EXCEEDED
+
+
+class TaskBatchNotFound(TaskError):
+    code = CODE_BATCH_NOT_FOUND
 
 
 class TaskStoreCorrupt(TaskError):
@@ -319,8 +344,25 @@ def _validate_task(task):
             raise TaskStoreCorrupt()
 
 
+def _validate_batch(batch):
+    if not isinstance(batch, dict) or set(batch) != _BATCH_KEYS:
+        raise TaskStoreCorrupt()
+    if not isinstance(batch["batch_id"], str) or not _BATCH_ID_RE.fullmatch(batch["batch_id"]):
+        raise TaskStoreCorrupt()
+    if not _is_timestamp(batch["created_at"]):
+        raise TaskStoreCorrupt()
+    task_ids = batch["task_ids"]
+    if not isinstance(task_ids, list) or not task_ids:
+        raise TaskStoreCorrupt()
+    if any(not isinstance(task_id, str) or not _TASK_ID_RE.fullmatch(task_id)
+           for task_id in task_ids):
+        raise TaskStoreCorrupt()
+
+
 def _validate_document(document):
-    if not isinstance(document, dict) or set(document) != {"format_version", "kind", "tasks"}:
+    if not isinstance(document, dict) \
+            or not _DOCUMENT_REQUIRED <= set(document) \
+            or not set(document) <= _DOCUMENT_KEYS:
         raise TaskStoreCorrupt()
     if document["format_version"] != FORMAT_VERSION or document["kind"] != STORE_KIND:
         raise TaskStoreCorrupt()
@@ -339,10 +381,31 @@ def _validate_document(document):
             if key in seen_keys:
                 raise TaskStoreCorrupt()
             seen_keys.add(key)
+    # Stores written before batches existed are still valid; the missing
+    # section is normalised to an empty one in memory (and on the next write).
+    batches = document.get("batches")
+    if batches is None:
+        document["batches"] = {}
+        return
+    if not isinstance(batches, dict):
+        raise TaskStoreCorrupt()
+    seen_batch_ids = set()
+    for batch_id, batch in batches.items():
+        _validate_batch(batch)
+        if batch_id != batch["batch_id"] or batch_id in seen_batch_ids:
+            raise TaskStoreCorrupt()
+        seen_batch_ids.add(batch_id)
+        task_ids = batch["task_ids"]
+        if len(set(task_ids)) != len(task_ids):
+            raise TaskStoreCorrupt()
+        for task_id in task_ids:
+            if task_id not in tasks:
+                raise TaskStoreCorrupt()
 
 
 def _empty_document():
-    return {"format_version": FORMAT_VERSION, "kind": STORE_KIND, "tasks": {}}
+    return {"format_version": FORMAT_VERSION, "kind": STORE_KIND,
+            "tasks": {}, "batches": {}}
 
 
 def _load_document(store_path):
@@ -422,6 +485,7 @@ def _locked_store(store_path, *, create_parents=True):
     try:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         document = _load_document(store_path) if store_path.exists() else _empty_document()
+        _recover_credentials(document)
 
         def persist():
             try:
@@ -436,6 +500,45 @@ def _locked_store(store_path, *, create_parents=True):
         with contextlib.suppress(OSError):
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
         lock_handle.close()
+
+
+def _staging_path(credential_path, task_id, attempt_number):
+    """The derivable staging path a proof attempt publishes its credential from.
+
+    The name is deterministic so that, after a crash, recovery can find the
+    staged credential of exactly one attempt without any extra journal.
+    """
+    credential_path = Path(credential_path)
+    return credential_path.with_name(
+        f".{credential_path.name}.{task_id}-{attempt_number}.pending")
+
+
+def _recover_credentials(document):
+    """Complete interrupted credential publishes of ``succeeded`` tasks.
+
+    The ``succeeded`` state and the credential digest are committed to the
+    store *before* the staged credential is renamed onto its final path, so a
+    crash in that window is recoverable: if the final credential is missing or
+    does not match the recorded digest but the staging file does, the publish
+    is completed atomically. Anything unrecoverable is left untouched, and a
+    task that never succeeded never had anything published to recover.
+    """
+    for task in document["tasks"].values():
+        if task["state"] != STATE_SUCCEEDED:
+            continue
+        digest = task["credential_sha256"]
+        final = Path(task["request"]["credential_path"])
+        try:
+            if final.is_file() and _sha256(final) == digest:
+                continue
+        except OSError:
+            pass
+        staging = _staging_path(final, task["task_id"], task["attempt"])
+        try:
+            if staging.is_file() and _sha256(staging) == digest:
+                os.replace(staging, final)
+        except OSError:
+            pass
 
 
 def _safe_view(task):
@@ -469,11 +572,15 @@ def _build_request(input_path, model, setup_dir, credential_path):
 
     Returns the request record to persist. Feature values are validated but
     returned separately so the caller can discard them; they are never stored.
+
+    All four paths are frozen to absolute canonical form against the calling
+    directory at create time, so a later ``run`` from any other working
+    directory still addresses exactly the artifacts that were validated.
     """
-    input_path = Path(input_path)
-    model = Path(model)
-    setup_dir = Path(setup_dir)
-    credential_path = Path(credential_path)
+    input_path = Path(input_path).expanduser().resolve()
+    model = Path(model).expanduser().resolve()
+    setup_dir = Path(setup_dir).expanduser().resolve()
+    credential_path = Path(credential_path).expanduser().resolve()
     # Full zk-prove pre-flight: features, manifest, model and every setup
     # artifact are validated now, before a task id exists.
     features, _paths, model_sha, _scale, _cred = _prepare_prove(
@@ -510,6 +617,37 @@ def _build_request(input_path, model, setup_dir, credential_path):
     return request
 
 
+def _validate_idempotency_key(idempotency_key):
+    if idempotency_key is not None and (
+            not isinstance(idempotency_key, str)
+            or not 1 <= len(idempotency_key) <= 200):
+        raise TaskError(CODE_INVALID_REQUEST)
+
+
+def _new_task_id(document):
+    task_id = "pt-" + uuid.uuid4().hex[:24]
+    while task_id in document["tasks"]:  # pragma: no cover - uuid4 collisions
+        task_id = "pt-" + uuid.uuid4().hex[:24]
+    return task_id
+
+
+def _new_task(task_id, request, idempotency_key, timestamp):
+    return {
+        "task_id": task_id,
+        "state": STATE_QUEUED,
+        "attempt": 0,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "started_at": None,
+        "ended_at": None,
+        "idempotency_key": idempotency_key,
+        "request": request,
+        "attempts": [],
+        "credential_sha256": None,
+        "last_error": None,
+    }
+
+
 def create_task(store_path, input_path, model, setup_dir, credential_path,
                 idempotency_key=None):
     """Atomically create a task in ``queued``; honour an idempotency key.
@@ -518,10 +656,7 @@ def create_task(store_path, input_path, model, setup_dir, credential_path,
     the original task. The same key with a different request is rejected
     without touching the store.
     """
-    if idempotency_key is not None and (
-            not isinstance(idempotency_key, str)
-            or not 1 <= len(idempotency_key) <= 200):
-        raise TaskError(CODE_INVALID_REQUEST)
+    _validate_idempotency_key(idempotency_key)
     try:
         request = _build_request(input_path, model, setup_dir, credential_path)
     except TaskError:
@@ -539,23 +674,8 @@ def create_task(store_path, input_path, model, setup_dir, credential_path,
                     if existing["request"]["request_sha256"] == request["request_sha256"]:
                         return _safe_view(existing), False
                     raise TaskIdempotencyConflict()
-        task_id = "pt-" + uuid.uuid4().hex[:24]
-        while task_id in document["tasks"]:  # pragma: no cover - uuid4 collisions
-            task_id = "pt-" + uuid.uuid4().hex[:24]
-        task = {
-            "task_id": task_id,
-            "state": STATE_QUEUED,
-            "attempt": 0,
-            "created_at": timestamp,
-            "updated_at": timestamp,
-            "started_at": None,
-            "ended_at": None,
-            "idempotency_key": idempotency_key,
-            "request": request,
-            "attempts": [],
-            "credential_sha256": None,
-            "last_error": None,
-        }
+        task_id = _new_task_id(document)
+        task = _new_task(task_id, request, idempotency_key, timestamp)
         document["tasks"][task_id] = task
         persist()
         return _safe_view(task), True
@@ -616,21 +736,17 @@ def _finish(document, task_id, attempt_number, outcome):
     task["ended_at"] = timestamp
     task["updated_at"] = timestamp
     if outcome["ok"]:
-        credential_path = Path(task["request"]["credential_path"])
-        if not credential_path.is_file():
-            # The proof succeeded but its output vanished: never report
+        digest = outcome.get("credential_sha256")
+        if not _is_sha256_hex(digest):
+            # The proof succeeded but its staged output vanished: never report
             # success without a credential.
-            outcome.update(ok=False, code=CODE_OUTPUT_IO, retryable=True)
+            outcome.update(ok=False, code=CODE_OUTPUT_IO,
+                           retryable=RETRYABLE[CODE_OUTPUT_IO])
         else:
-            try:
-                digest = _sha256(credential_path)
-            except OSError:
-                outcome.update(ok=False, code=CODE_OUTPUT_IO, retryable=True)
-            else:
-                entry["state"] = STATE_SUCCEEDED
-                entry["credential_sha256"] = digest
-                task["state"] = STATE_SUCCEEDED
-                task["credential_sha256"] = digest
+            entry["state"] = STATE_SUCCEEDED
+            entry["credential_sha256"] = digest
+            task["state"] = STATE_SUCCEEDED
+            task["credential_sha256"] = digest
     if not outcome["ok"]:
         code = outcome["code"]
         retryable = outcome["retryable"]
@@ -727,9 +843,13 @@ def run_task(store_path, task_id):
 
     Only ``queued -> running -> succeeded/failed`` is possible. The claim is
     committed before proving starts, so competing runners fail with
-    ``conflict``; success is recorded only after a real credential exists and
-    is hashed. Every failure — including interruption — is recorded as a
-    failed attempt and can never overwrite a prior credential.
+    ``conflict``. The proof is written to a per-attempt staging file and the
+    ``succeeded`` state (with the credential digest) is committed to the store
+    *before* the credential is atomically renamed onto its final path, so a
+    failure, interruption or crash can never overwrite a pre-existing
+    credential, and a task that did not succeed never leaves a new credential
+    behind. A crash between the commit and the rename is healed by
+    ``_recover_credentials`` on the next store access.
     """
     # Claim under the lock, then prove without holding it.
     with _locked_store(store_path, create_parents=False) as (document, persist):
@@ -737,14 +857,22 @@ def run_task(store_path, task_id):
         request = task["request"]
         persist()
 
+    credential_path = Path(request["credential_path"])
+    staging_path = _staging_path(credential_path, task_id, attempt_number)
     outcome = None
     try:
         _verify_request_materials(request)
-        features, paths, model_sha, scale, credential_path = _prepare_prove(
+        features, paths, model_sha, scale, _final_path = _prepare_prove(
             request["input_path"], request["model_path"],
             request["setup_dir"], request["credential_path"])
-        _issue_credential(features, paths, model_sha, scale, credential_path)
-        outcome = {"ok": True}
+        _issue_credential(features, paths, model_sha, scale, staging_path)
+        try:
+            digest = _sha256(staging_path)
+        except OSError:
+            outcome = {"ok": False, "code": CODE_OUTPUT_IO,
+                       "retryable": RETRYABLE[CODE_OUTPUT_IO]}
+        else:
+            outcome = {"ok": True, "credential_sha256": digest}
     except BaseException as error:  # noqa: BLE001 - includes KeyboardInterrupt
         if isinstance(error, TaskError):
             raise
@@ -756,6 +884,11 @@ def run_task(store_path, task_id):
             code, retryable = _classify(error)
         outcome = {"ok": False, "code": code, "retryable": retryable}
 
+    if not outcome["ok"]:
+        # A task that did not succeed must not leave a new credential behind.
+        with contextlib.suppress(OSError):
+            staging_path.unlink()
+
     # Finalise under the lock from a fresh on-disk read. A failed proof is
     # recorded first; a failure of that bookkeeping (e.g. corrupt store) is a
     # TaskError that must not be masked by the proof error.
@@ -765,6 +898,12 @@ def run_task(store_path, task_id):
         view = _safe_view(finished)
     if not outcome["ok"]:
         raise TaskAttemptFailed(outcome["code"], outcome["retryable"], view)
+    try:
+        # Publish only now that the succeeded state is durable. If this rename
+        # fails (or the process dies here), recovery completes the publish.
+        os.replace(staging_path, credential_path)
+    except OSError:
+        pass
     return view
 
 
@@ -793,3 +932,178 @@ def retry_task(store_path, task_id):
         task["last_error"] = None
         persist()
         return _safe_view(task)
+
+
+# -- batches -----------------------------------------------------------------
+
+
+def _parse_batch_items(items):
+    """Validate the raw ``items`` array of a batch-create request.
+
+    Every item takes exactly the single-task prove arguments plus an optional
+    idempotency key; anything else rejects the whole batch before any proving
+    pre-flight or store write happens.
+    """
+    if not isinstance(items, list) or not items:
+        raise TaskError(CODE_INVALID_REQUEST)
+    specs = []
+    for item in items:
+        if not isinstance(item, dict) \
+                or not _BATCH_ITEM_REQUIRED <= set(item) \
+                or not set(item) <= _BATCH_ITEM_REQUIRED | _BATCH_ITEM_OPTIONAL:
+            raise TaskError(CODE_INVALID_REQUEST)
+        for field in _BATCH_ITEM_REQUIRED:
+            if not isinstance(item[field], str) or not item[field]:
+                raise TaskError(CODE_INVALID_REQUEST)
+        idempotency_key = item.get("idempotency_key")
+        _validate_idempotency_key(idempotency_key)
+        specs.append((item["input"], item["model"], item["setup_dir"],
+                      item["credential"], idempotency_key))
+    return specs
+
+
+def _batch_view(batch, document):
+    """Total, four-state counts and safe task views in creation order."""
+    tasks = [document["tasks"][task_id] for task_id in batch["task_ids"]]
+    states = {STATE_QUEUED: 0, STATE_RUNNING: 0,
+              STATE_SUCCEEDED: 0, STATE_FAILED: 0}
+    for task in tasks:
+        states[task["state"]] += 1
+    return {
+        "batch_id": batch["batch_id"],
+        "total": len(tasks),
+        "states": states,
+        "tasks": [_safe_view(task) for task in tasks],
+    }
+
+
+def _get_batch(document, batch_id):
+    if not isinstance(batch_id, str) or not _BATCH_ID_RE.fullmatch(batch_id):
+        raise TaskError(CODE_INVALID_REQUEST)
+    batch = document["batches"].get(batch_id)
+    if batch is None:
+        raise TaskBatchNotFound()
+    return batch
+
+
+def create_batch(store_path, items, max_queued=None):
+    """Atomically create a whole batch of queued tasks, or nothing at all.
+
+    Every item is pre-validated exactly like a single ``create`` before
+    anything is written; one bad item rejects the entire batch and the store
+    is left untouched. The batch id is a stable function of the item
+    requests, so re-creating the identical batch returns the original batch
+    instead of duplicating its tasks. ``max_queued`` caps the total number of
+    queued tasks in the store; exceeding it fails with the non-retryable
+    ``capacity_exceeded`` and writes nothing.
+    """
+    if max_queued is not None and (
+            not isinstance(max_queued, int) or isinstance(max_queued, bool)
+            or max_queued < 0):
+        raise TaskError(CODE_INVALID_REQUEST)
+    specs = _parse_batch_items(items)
+    prepared = []
+    for input_path, model, setup_dir, credential_path, idempotency_key in specs:
+        try:
+            request = _build_request(input_path, model, setup_dir, credential_path)
+        except TaskError:
+            raise
+        except ZkError as error:
+            code, retryable = _classify(error)
+            raise TaskError(code, retryable=retryable) from None
+        prepared.append((idempotency_key, request))
+    # A key repeated inside the batch must name the identical request; equal
+    # (key, request) pairs collapse into a single task.
+    units = []          # (idempotency_key, request), deduplicated by key
+    unit_of_key = {}
+    item_units = []     # unit index per item, in item order
+    for idempotency_key, request in prepared:
+        if idempotency_key is not None:
+            previous = unit_of_key.get(idempotency_key)
+            if previous is not None:
+                if units[previous][1]["request_sha256"] != request["request_sha256"]:
+                    raise TaskIdempotencyConflict()
+                item_units.append(previous)
+                continue
+            unit_of_key[idempotency_key] = len(units)
+        units.append((idempotency_key, request))
+        item_units.append(len(units) - 1)
+    batch_id = "pb-" + hashlib.sha256(_canonical_json(
+        [[key, request["request_sha256"]] for key, request in prepared]
+    ).encode("utf-8")).hexdigest()[:24]
+    timestamp = _utcnow()
+    with _locked_store(store_path) as (document, persist):
+        existing = document["batches"].get(batch_id)
+        if existing is not None:
+            return _batch_view(existing, document), False
+        keyed = {}
+        for task in document["tasks"].values():
+            if task["idempotency_key"] is not None:
+                keyed[task["idempotency_key"]] = task
+        unit_tasks = []     # task id per unit, None for tasks still to create
+        for idempotency_key, request in units:
+            if idempotency_key is not None and idempotency_key in keyed:
+                existing_task = keyed[idempotency_key]
+                if existing_task["request"]["request_sha256"] != request["request_sha256"]:
+                    raise TaskIdempotencyConflict()
+                unit_tasks.append(existing_task["task_id"])
+            else:
+                unit_tasks.append(None)
+        new_count = sum(1 for task_id in unit_tasks if task_id is None)
+        if max_queued is not None:
+            queued = sum(1 for task in document["tasks"].values()
+                         if task["state"] == STATE_QUEUED)
+            if queued + new_count > max_queued:
+                raise TaskCapacityExceeded()
+        for index, (idempotency_key, request) in enumerate(units):
+            if unit_tasks[index] is None:
+                task_id = _new_task_id(document)
+                document["tasks"][task_id] = _new_task(
+                    task_id, request, idempotency_key, timestamp)
+                unit_tasks[index] = task_id
+        task_ids = list(dict.fromkeys(unit_tasks[index] for index in item_units))
+        document["batches"][batch_id] = {
+            "batch_id": batch_id,
+            "created_at": timestamp,
+            "task_ids": task_ids,
+        }
+        persist()
+        return _batch_view(document["batches"][batch_id], document), True
+
+
+def status_batch(store_path, batch_id):
+    """Return the batch projection; never mutates the store."""
+    with _locked_store(store_path, create_parents=False) as (document, _persist):
+        return _batch_view(_get_batch(document, batch_id), document)
+
+
+def run_batch(store_path, batch_id, max_workers=1):
+    """Claim and execute the queued tasks of one batch, then report the batch.
+
+    Only this batch's tasks are ever claimed, at most ``max_workers`` run
+    concurrently, and each task goes through the same exclusive claim,
+    attempt accounting and real EZKL proof as a single ``run``. A failing
+    item is journaled on its task and never blocks the remaining items;
+    tasks that are not queued (running, succeeded, failed) are left alone.
+    """
+    if not isinstance(max_workers, int) or isinstance(max_workers, bool) \
+            or max_workers < 1:
+        raise TaskError(CODE_INVALID_REQUEST)
+    with _locked_store(store_path, create_parents=False) as (document, _persist):
+        batch = _get_batch(document, batch_id)
+        task_ids = list(batch["task_ids"])
+
+    def execute(task_id):
+        try:
+            run_task(store_path, task_id)
+        except TaskAttemptFailed:
+            pass  # the failed attempt is journaled on the task itself
+        except (TaskInvalidState, TaskConflict):
+            pass  # not claimable (already running/succeeded/failed); leave it
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="proof-task") as pool:
+        list(pool.map(execute, task_ids))
+
+    with _locked_store(store_path, create_parents=False) as (document, _persist):
+        return _batch_view(_get_batch(document, batch_id), document)

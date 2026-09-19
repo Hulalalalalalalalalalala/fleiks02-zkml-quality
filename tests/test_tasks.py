@@ -21,15 +21,21 @@ from zkml_quality.inference import ROOT
 from zkml_quality.tasks import (
     SAFE_MESSAGES,
     TaskAttemptFailed,
+    TaskBatchNotFound,
+    TaskCapacityExceeded,
     TaskConflict,
     TaskError,
     TaskIdempotencyConflict,
     TaskInvalidState,
     TaskNotFound,
     TaskStoreCorrupt,
+    TaskStoreIo,
+    create_batch,
     create_task,
     retry_task,
+    run_batch,
     run_task,
+    status_batch,
     status_task,
 )
 from zkml_quality.zk import (
@@ -517,6 +523,317 @@ class ProofTaskTest(unittest.TestCase):
             "--credential", self.credential, "--idempotency-key", "k")
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(json.loads(proc.stdout)["task_id"], tid)
+
+    # -- canonical paths -----------------------------------------------------
+
+    def test_create_freezes_relative_paths_against_calling_directory(self):
+        # Create with paths relative to one directory, run from another: the
+        # task must still address exactly the artifacts validated at create.
+        rel = self.dir / "rel"
+        (rel / "out").mkdir(parents=True)
+        (rel / "input.json").write_text(
+            json.dumps({"features": FEATURES}), encoding="utf-8")
+        previous_cwd = os.getcwd()
+        try:
+            os.chdir(rel)
+            view, created = create_task(
+                self.store, "input.json", os.path.relpath(MODEL),
+                os.path.relpath(self.setup), "out/credential.json")
+        finally:
+            os.chdir(previous_cwd)
+        self.assertTrue(created)
+        tid = view["task_id"]
+        request = self.document()["tasks"][tid]["request"]
+        for key in ("input_path", "model_path", "setup_dir", "credential_path"):
+            self.assertTrue(os.path.isabs(request[key]), key)
+        # Run from a different working directory: no drift.
+        other = self.dir / "elsewhere"
+        other.mkdir()
+        try:
+            os.chdir(other)
+            view = run_task(self.store, tid)
+        finally:
+            os.chdir(previous_cwd)
+        self.assertEqual(view["state"], "succeeded")
+        self.assertTrue((rel / "out" / "credential.json").is_file())
+
+    # -- store_io retryable --------------------------------------------------
+
+    def test_store_io_is_always_retryable(self):
+        blocker = self.dir / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+        with self.assertRaises(TaskStoreIo) as caught:
+            create_task(blocker / "store.json", self.input_path, MODEL,
+                        self.setup, self.credential)
+        self.assertEqual(caught.exception.code, "store_io")
+        self.assertIs(caught.exception.retryable, True)
+
+        proc = self.cli("status", "--store", blocker / "store.json",
+                        "--task-id", "pt-" + "0" * 24)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        payload = json.loads(proc.stderr)
+        self.assertEqual(payload["error"]["code"], "store_io")
+        self.assertIs(payload["error"]["retryable"], True)
+
+    # -- credential publish recovery -----------------------------------------
+
+    def test_interrupted_publish_is_recovered_on_next_access(self):
+        tid = self.create()
+        real_replace = os.replace
+        crashed = []
+
+        def flaky_replace(src, dst, *args, **kwargs):
+            # Simulate a crash exactly once: after the succeeded state is
+            # durable but before the staged credential is published.
+            if str(src).endswith(".pending") and not crashed:
+                crashed.append(src)
+                raise OSError("simulated crash before publish")
+            return real_replace(src, dst, *args, **kwargs)
+
+        with mock.patch("zkml_quality.tasks.os.replace", flaky_replace):
+            view = run_task(self.store, tid)
+        self.assertEqual(view["state"], "succeeded")
+        self.assertEqual(len(crashed), 1)
+        # The publish never happened, but the succeeded state is durable.
+        self.assertFalse(self.credential.exists())
+        self.assertTrue(Path(crashed[0]).is_file())
+        # The next store access heals the publish from the staging file.
+        recovered = status_task(self.store, tid)
+        self.assertEqual(recovered["state"], "succeeded")
+        self.assertTrue(self.credential.is_file())
+        import hashlib
+        self.assertEqual(view["credential_sha256"],
+                         hashlib.sha256(self.credential.read_bytes()).hexdigest())
+        self.assertFalse(Path(crashed[0]).exists())
+
+    def test_failed_attempt_leaves_no_new_credential(self):
+        tid = self.create()
+
+        def write_then_fail(features, paths, model_sha, scale, credential_path):
+            Path(credential_path).write_text("partial credential", encoding="utf-8")
+            raise ZkEzklError("boom")
+
+        with mock.patch("zkml_quality.tasks._issue_credential", write_then_fail):
+            with self.assertRaises(TaskAttemptFailed) as caught:
+                run_task(self.store, tid)
+        self.assertEqual(caught.exception.code, "ezkl_failure")
+        self.assertFalse(self.credential.exists())
+        leftovers = [p.name for p in self.dir.iterdir() if p.name.endswith(".pending")]
+        self.assertEqual(leftovers, [])
+
+    # -- batches --------------------------------------------------------------
+
+    def batch_items(self, *credentials, setup=None):
+        return [
+            {"input": str(self.input_path), "model": str(MODEL),
+             "setup_dir": str(setup or self.setup), "credential": str(credential)}
+            for credential in credentials
+        ]
+
+    def test_batch_create_status_run_roundtrip(self):
+        items = self.batch_items(self.dir / "b1.json", self.dir / "b2.json")
+        items[1]["idempotency_key"] = "batch-key-2"
+        view, created = create_batch(self.store, items)
+        self.assertTrue(created)
+        self.assertRegex(view["batch_id"], r"^pb-[0-9a-f]{24}$")
+        self.assertEqual(view["total"], 2)
+        self.assertEqual(view["states"], {"queued": 2, "running": 0,
+                                          "succeeded": 0, "failed": 0})
+        self.assertEqual(len(view["tasks"]), 2)
+        for task_view in view["tasks"]:
+            self.assertEqual(set(task_view),
+                             {"task_id", "state", "attempt", "created_at",
+                              "started_at", "ended_at", "updated_at",
+                              "credential_sha256"})
+            self.assertEqual(task_view["state"], "queued")
+        # Tasks are listed in creation order.
+        created_ats = [t["created_at"] for t in view["tasks"]]
+        self.assertEqual(created_ats, sorted(created_ats))
+
+        # The batch id is stable: an identical batch-create returns the
+        # original batch and writes nothing new.
+        again, created_again = create_batch(self.store, items)
+        self.assertFalse(created_again)
+        self.assertEqual(again["batch_id"], view["batch_id"])
+        self.assertEqual(len(self.document()["tasks"]), 2)
+
+        status = status_batch(self.store, view["batch_id"])
+        self.assertEqual(status["states"]["queued"], 2)
+
+        result = run_batch(self.store, view["batch_id"], max_workers=2)
+        self.assertEqual(result["states"], {"queued": 0, "running": 0,
+                                            "succeeded": 2, "failed": 0})
+        for index, task_view in enumerate(result["tasks"]):
+            self.assertEqual(task_view["state"], "succeeded")
+            self.assertEqual(task_view["attempt"], 1)
+            credential = self.dir / f"b{index + 1}.json"
+            self.assertTrue(credential.is_file())
+            import hashlib
+            self.assertEqual(
+                task_view["credential_sha256"],
+                hashlib.sha256(credential.read_bytes()).hexdigest())
+        # A re-run does not re-claim terminal tasks.
+        result = run_batch(self.store, view["batch_id"])
+        self.assertEqual([t["attempt"] for t in result["tasks"]], [1, 1])
+
+    def test_batch_create_all_or_nothing_and_capacity(self):
+        bad_input = self.dir / "bad.json"
+        bad_input.write_text(json.dumps({"features": [1] * 5}), encoding="utf-8")
+        items = self.batch_items(self.dir / "ok.json", self.dir / "never.json")
+        items[1]["input"] = str(bad_input)
+        with self.assertRaises(TaskError) as caught:
+            create_batch(self.store, items)
+        self.assertEqual(caught.exception.code, "invalid_input")
+        self.assertFalse(self.store.exists())
+
+        # Malformed batch shapes are invalid requests.
+        for bad_items in ([], "nope", [{"input": "x"}], [dict(
+                input="i", model="m", setup_dir="s", credential="c", extra="e")]):
+            with self.subTest(bad_items=bad_items):
+                with self.assertRaises(TaskError) as caught:
+                    create_batch(self.store, bad_items)
+                self.assertEqual(caught.exception.code, "invalid_request")
+        self.assertFalse(self.store.exists())
+
+        # Capacity counts every queued task in the store.
+        self.create()
+        items = self.batch_items(self.dir / "c1.json", self.dir / "c2.json")
+        before = self.store.read_bytes()
+        with self.assertRaises(TaskCapacityExceeded) as caught:
+            create_batch(self.store, items, max_queued=2)
+        self.assertEqual(caught.exception.code, "capacity_exceeded")
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(self.store.read_bytes(), before)
+        view, created = create_batch(self.store, items, max_queued=3)
+        self.assertTrue(created)
+        self.assertEqual(view["total"], 2)
+
+    def test_batch_item_failure_does_not_block_others(self):
+        setup2 = self.dir / "setup2"
+        shutil.copytree(self.setup, setup2)
+        items = [
+            {"input": str(self.input_path), "model": str(MODEL),
+             "setup_dir": str(self.setup), "credential": str(self.dir / "ok.json")},
+            {"input": str(self.input_path), "model": str(MODEL),
+             "setup_dir": str(setup2), "credential": str(self.dir / "broken.json")},
+        ]
+        view, _ = create_batch(self.store, items)
+        batch_id = view["batch_id"]
+        backup = self.dir / "pk.bak"
+        shutil.move(setup2 / "proving.key", backup)
+
+        result = run_batch(self.store, batch_id, max_workers=2)
+        self.assertEqual(result["states"], {"queued": 0, "running": 0,
+                                            "succeeded": 1, "failed": 1})
+        self.assertTrue((self.dir / "ok.json").is_file())
+        self.assertFalse((self.dir / "broken.json").exists())
+        failed = [t for t in result["tasks"] if t["state"] == "failed"]
+        self.assertEqual(len(failed), 1)
+
+        # Failed items keep the single-task retry semantics.
+        shutil.move(backup, setup2 / "proving.key")
+        retry_task(self.store, failed[0]["task_id"])
+        result = run_batch(self.store, batch_id)
+        self.assertEqual(result["states"]["succeeded"], 2)
+        self.assertTrue((self.dir / "broken.json").is_file())
+
+    def test_batch_validation_and_not_found(self):
+        view, _ = create_batch(self.store, self.batch_items(self.dir / "one.json"))
+        batch_id = view["batch_id"]
+        for bad_workers in (0, -1, 1.5, True, "2"):
+            with self.subTest(max_workers=bad_workers):
+                with self.assertRaises(TaskError) as caught:
+                    run_batch(self.store, batch_id, max_workers=bad_workers)
+                self.assertEqual(caught.exception.code, "invalid_request")
+        with self.assertRaises(TaskBatchNotFound):
+            status_batch(self.store, "pb-" + "0" * 24)
+        with self.assertRaises(TaskBatchNotFound):
+            run_batch(self.store, "pb-" + "0" * 24)
+        with self.assertRaises(TaskError) as caught:
+            status_batch(self.store, "not-a-batch-id")
+        self.assertEqual(caught.exception.code, "invalid_request")
+
+    def test_batch_item_idempotency_conflict_rejects_whole_batch(self):
+        create_task(self.store, self.input_path, MODEL, self.setup,
+                    self.credential, "taken")
+        items = self.batch_items(self.dir / "other.json")
+        items[0]["idempotency_key"] = "taken"
+        before = self.store.read_bytes()
+        with self.assertRaises(TaskIdempotencyConflict):
+            create_batch(self.store, items)
+        self.assertEqual(self.store.read_bytes(), before)
+
+    def test_batch_views_are_safe(self):
+        items = self.batch_items(self.dir / "s1.json", self.dir / "s2.json")
+        view, _ = create_batch(self.store, items)
+        result = run_batch(self.store, view["batch_id"], max_workers=2)
+        blob = json.dumps([view, result, status_batch(self.store, view["batch_id"])])
+        for secret in ("features", str(self.dir), "proof", "setup",
+                       str(MODEL), ".json", "samples"):
+            self.assertNotIn(secret, blob)
+
+    def test_cli_batch_roundtrip_and_errors(self):
+        batch_file = self.dir / "batch.json"
+        batch_file.write_text(json.dumps({
+            "items": self.batch_items(self.dir / "c1.json", self.dir / "c2.json"),
+        }), encoding="utf-8")
+        proc = self.cli("batch-create", "--store", self.store, "--file", batch_file)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        payload = json.loads(proc.stdout)
+        self.assertEqual(set(payload), {"batch_id", "total", "states", "tasks"})
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual(payload["states"]["queued"], 2)
+        batch_id = payload["batch_id"]
+
+        # Identical batch file: same stable batch id.
+        proc = self.cli("batch-create", "--store", self.store, "--file", batch_file)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(json.loads(proc.stdout)["batch_id"], batch_id)
+
+        proc = self.cli("batch-run", "--store", self.store,
+                        "--batch-id", batch_id, "--max-workers", "2")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["states"]["succeeded"], 2)
+        self.assertNotIn(str(self.dir), proc.stdout)
+        self.assertNotIn("features", proc.stdout)
+
+        proc = self.cli("batch-status", "--store", self.store, "--batch-id", batch_id)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(json.loads(proc.stdout)["states"]["succeeded"], 2)
+
+        # Failures: nonzero, stdout empty, one safe JSON object on stderr.
+        proc = self.cli("batch-status", "--store", self.store,
+                        "--batch-id", "pb-" + "0" * 24)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr)["error"]["code"], "batch_not_found")
+
+        proc = self.cli("batch-run", "--store", self.store,
+                        "--batch-id", batch_id, "--max-workers", "0")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr)["error"]["code"], "invalid_request")
+
+        proc = self.cli("batch-create", "--store", self.dir / "other.json",
+                        "--file", self.dir / "missing.json")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(json.loads(proc.stderr)["error"]["code"], "invalid_request")
+
+        # Capacity overflow is a non-retryable capacity_exceeded on stderr.
+        other_store = self.dir / "capped.json"
+        proc = self.cli("batch-create", "--store", other_store,
+                        "--file", batch_file, "--max-queued", "1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        payload = json.loads(proc.stderr)
+        self.assertEqual(payload["error"]["code"], "capacity_exceeded")
+        self.assertIs(payload["error"]["retryable"], False)
+        self.assertFalse(other_store.exists())
 
 
 if __name__ == "__main__":
