@@ -11,7 +11,10 @@ Three stages:
 * ``run_verify`` checks a credential against public materials the verifier
   independently obtained: the setup manifest plus the ONNX model, settings,
   VK and SRS named by it. It needs neither the original input nor the proving
-  key nor the compiled circuit nor any network access.
+  key nor the compiled circuit nor any network access. Before anything else,
+  the model version must be admitted by the verifier's local model registry
+  (see ``registry.py``): only an ``enabled`` record whose pinned digests match
+  the supplied manifest and model is allowed through.
 
 Trust model: the verifier's own ``manifest.json`` (obtained through a channel
 the verifier trusts, e.g. produced by their own ``zk-setup`` run) is the single
@@ -494,8 +497,17 @@ def _load_credential(credential_path):
     return credential
 
 
-def run_verify(credential_path, manifest_path, model, settings_path, vk_path, srs_path):
+def run_verify(credential_path, manifest_path, model, settings_path, vk_path, srs_path,
+               registry_path, model_version):
     """Verify a credential offline against the verifier's own trust material.
+
+    The verifier's local model registry is the admission gate: the requested
+    model version must be registered and ``enabled``, and the record must pin
+    exactly the manifest and model the verifier supplied (digests recomputed
+    from the files) as well as the manifest's EZKL version, output scale and
+    settings/VK/SRS digests. An unregistered, disabled or revoked version, a
+    corrupt registry, or any mismatch is rejected before the credential is
+    even read.
 
     The verifier's ``manifest.json`` — not the credential — is the root of
     trust. The model digest and every settings/VK/SRS digest are recomputed
@@ -505,11 +517,40 @@ def run_verify(credential_path, manifest_path, model, settings_path, vk_path, sr
     to agree with the manifest, and a proof for a different circuit/key cannot
     pass EZKL against the pinned VK and settings.
     """
+    from .registry import require_enabled_record
+
+    # Registry admission gate: an enabled record must pin the exact trusted
+    # manifest and model files the verifier supplied.
+    record = require_enabled_record(registry_path, model_version)
+    manifest_path = _require_file(manifest_path, "setup manifest")
+    model = _require_file(model, "ONNX model")
+    if _sha256(manifest_path) != record["manifest_sha256"]:
+        raise ZkError(
+            f"manifest does not match the registered record for model version "
+            f"'{model_version}'")
+    if _sha256(model) != record["model_sha256"]:
+        raise ZkError(
+            f"model does not match the registered record for model version "
+            f"'{model_version}'")
+
     # Bind model, circuit (via the VK generated for it) and verification
     # parameters to the verifier's manifest before touching the credential.
     materials = load_verifier_materials(
         manifest_path, model, settings_path, vk_path, srs_path)
     manifest = materials["manifest"]
+
+    # The record must agree with the trusted manifest on every parameter it
+    # pins (defence in depth: the manifest digest already binds the content).
+    if record["ezkl_version"] != manifest["ezkl_version"]:
+        raise ZkError("registered EZKL version does not match the verifier manifest")
+    if record["output_scale"] != manifest["output_scale"]:
+        raise ZkError("registered output scale does not match the verifier manifest")
+    for key in VERIFICATION_ARTIFACTS:
+        if record["artifacts"][key] != manifest["artifacts"][key]:
+            raise ZkError(
+                f"registered {ARTIFACT_NAMES[key]} digest does not match the "
+                "verifier manifest")
+
     paths = materials["paths"]
     model_sha = materials["model_sha256"]
     scale = materials["output_scale"]

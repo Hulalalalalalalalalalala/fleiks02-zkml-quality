@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 from zkml_quality.inference import ROOT, infer
+from zkml_quality.registry import enable_model, register_model, revoke_model
 from zkml_quality.zk import (
     LABELS,
     ZkError,
@@ -47,6 +48,14 @@ class ZkLoopTest(unittest.TestCase):
         shutil.copy(cls.setup_dir / "srs", cls.verifier_dir / "srs")
         shutil.copy(MODEL, cls.verifier_dir / "model.onnx")
 
+        # The verifier's local registry records the trusted manifest and model
+        # under a version they then enable; verification is gated on it.
+        cls.registry_path = cls.workspace / "registry.json"
+        cls.model_version = "1.0.0"
+        register_model(cls.registry_path, cls.model_version,
+                       cls.verifier_dir / "manifest.json", cls.verifier_dir / "model.onnx")
+        enable_model(cls.registry_path, cls.model_version)
+
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.workspace, ignore_errors=True)
@@ -64,12 +73,15 @@ class ZkLoopTest(unittest.TestCase):
             "settings": self.verifier_dir / "settings.json",
             "vk": self.verifier_dir / "vk",
             "srs": self.verifier_dir / "srs",
+            "registry": self.registry_path,
+            "model_version": self.model_version,
         }
         materials.update(overrides)
         return run_verify(
             credential_path,
             self.verifier_dir / "manifest.json" if manifest_path is None else manifest_path,
-            materials["model"], materials["settings"], materials["vk"], materials["srs"])
+            materials["model"], materials["settings"], materials["vk"], materials["srs"],
+            materials["registry"], materials["model_version"])
 
     def _write_different_model(self, name="other.onnx"):
         import onnx
@@ -159,6 +171,49 @@ class ZkLoopTest(unittest.TestCase):
         _, credential_path = self._prove("verifieronly", [0.125] * 6)
         self.assertFalse((self.verifier_dir / "proving.key").exists())
         self.assertFalse((self.verifier_dir / "compiled.ezkl").exists())
+        self.assertTrue(self._verify(credential_path)["verified"])
+
+    def test_verify_requires_an_enabled_registered_version(self):
+        _, credential_path = self._prove("gating", [0.125] * 6)
+
+        # Unregistered version, invalid version string, missing registry.
+        with self.assertRaises(ZkError):
+            self._verify(credential_path, model_version="9.9.9")
+        with self.assertRaises(ZkError):
+            self._verify(credential_path, model_version="bad version!")
+        with self.assertRaises(ZkError):
+            self._verify(credential_path, registry=self.workspace / "no-registry.json")
+
+        # Corrupt registry: rejected and left byte-for-byte untouched.
+        corrupt = self.workspace / "corrupt-registry.json"
+        corrupt.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(ZkError):
+            self._verify(credential_path, registry=corrupt)
+        self.assertEqual(corrupt.read_text(encoding="utf-8"), "{not json")
+
+        # Registered but still disabled: not admitted.
+        gated_registry = self.workspace / "gated-registry.json"
+        register_model(gated_registry, "2.0.0",
+                       self.verifier_dir / "manifest.json", self.verifier_dir / "model.onnx")
+        with self.assertRaises(ZkError):
+            self._verify(credential_path, registry=gated_registry, model_version="2.0.0")
+
+        # Revoked is terminal: verification stays refused and re-enabling fails.
+        revoke_model(gated_registry, "2.0.0")
+        with self.assertRaises(ZkError):
+            self._verify(credential_path, registry=gated_registry, model_version="2.0.0")
+        with self.assertRaises(ZkError):
+            enable_model(gated_registry, "2.0.0")
+
+        # A manifest/model pair the record does not pin is refused at the gate.
+        evil = self._evil_copy("evil-gating")
+        (evil / "model.onnx").write_bytes((evil / "model.onnx").read_bytes() + b"\x00")
+        with self.assertRaises(ZkError):
+            self._verify(credential_path, manifest_path=evil / "manifest.json",
+                        model=evil / "model.onnx", settings=evil / "settings.json",
+                        vk=evil / "vk", srs=evil / "srs")
+
+        # The enabled record still verifies.
         self.assertTrue(self._verify(credential_path)["verified"])
 
     def test_manifest_pins_every_public_material(self):
@@ -404,7 +459,9 @@ class ZkLoopTest(unittest.TestCase):
              "--model", str(self.verifier_dir / "model.onnx"),
              "--settings", str(self.verifier_dir / "settings.json"),
              "--vk", str(self.verifier_dir / "vk"),
-             "--srs", str(self.verifier_dir / "srs")],
+             "--srs", str(self.verifier_dir / "srs"),
+             "--registry", str(self.registry_path),
+             "--model-version", self.model_version],
             cwd=str(ROOT), capture_output=True, text=True)
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout, "")
@@ -417,11 +474,27 @@ class ZkLoopTest(unittest.TestCase):
              "--model", str(self.verifier_dir / "model.onnx"),
              "--settings", str(self.verifier_dir / "settings.json"),
              "--vk", str(self.verifier_dir / "vk"),
-             "--srs", str(self.verifier_dir / "srs")],
+             "--srs", str(self.verifier_dir / "srs"),
+             "--registry", str(self.registry_path),
+             "--model-version", self.model_version],
             cwd=str(ROOT), capture_output=True, text=True)
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout, "")
         self.assertIn("--manifest", proc.stderr)
+
+        # --registry and --model-version are mandatory too.
+        proc = subprocess.run(
+            [sys.executable, "-m", "zkml_quality", "zk-verify",
+             "--credential", str(bad),
+             "--manifest", str(self.verifier_dir / "manifest.json"),
+             "--model", str(self.verifier_dir / "model.onnx"),
+             "--settings", str(self.verifier_dir / "settings.json"),
+             "--vk", str(self.verifier_dir / "vk"),
+             "--srs", str(self.verifier_dir / "srs")],
+            cwd=str(ROOT), capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("--registry", proc.stderr)
 
     def test_cli_success_prints_single_json(self):
         _, credential_path = self._prove("cligood", [0.125] * 6)
@@ -432,7 +505,9 @@ class ZkLoopTest(unittest.TestCase):
              "--model", str(self.verifier_dir / "model.onnx"),
              "--settings", str(self.verifier_dir / "settings.json"),
              "--vk", str(self.verifier_dir / "vk"),
-             "--srs", str(self.verifier_dir / "srs")],
+             "--srs", str(self.verifier_dir / "srs"),
+             "--registry", str(self.registry_path),
+             "--model-version", self.model_version],
             cwd=str(ROOT), capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         result = json.loads(proc.stdout)
@@ -461,7 +536,8 @@ class ZkLoopTest(unittest.TestCase):
             run_verify(self.workspace / "missing-credential.json",
                        self.verifier_dir / "manifest.json",
                        MODEL, self.verifier_dir / "settings.json",
-                       self.verifier_dir / "vk", self.verifier_dir / "srs")
+                       self.verifier_dir / "vk", self.verifier_dir / "srs",
+                       self.registry_path, self.model_version)
         for missing in ("model.onnx", "settings.json", "vk", "srs"):
             with self.assertRaises(ZkError):
                 run_verify(
@@ -474,7 +550,8 @@ class ZkLoopTest(unittest.TestCase):
                     self.workspace / "missing-vk" if missing == "vk"
                     else self.verifier_dir / "vk",
                     self.workspace / "missing-srs" if missing == "srs"
-                    else self.verifier_dir / "srs")
+                    else self.verifier_dir / "srs",
+                    self.registry_path, self.model_version)
 
     def test_setup_refuses_nonempty_directory(self):
         occupied = self.workspace / "occupied"

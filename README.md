@@ -15,7 +15,7 @@ The current interface runs ordinary local inference and a two-sample demo. It do
 
 ## Zero-knowledge proofs (EZKL 23.0.5, CPU, offline)
 
-Three additional subcommands run a real proving loop with [EZKL](https://github.com/zkonduit/ezkl) 23.0.5. Input features stay private; only the two circuit outputs are public instances. Nothing is mocked or replaced by digests, and no network is contacted.
+Additional subcommands run a real proving loop with [EZKL](https://github.com/zkonduit/ezkl) 23.0.5 and manage the verifier's local model registry. Input features stay private; only the two circuit outputs are public instances. Nothing is mocked or replaced by digests, and no network is contacted.
 
 ```sh
 # 1. Compile the circuit and generate settings, SRS, proving and verification keys.
@@ -27,11 +27,19 @@ python -m zkml_quality zk-setup --model models/quality.onnx --dir setup
 python -m zkml_quality zk-prove --input samples/normal.json \
     --model models/quality.onnx --setup-dir setup --credential credential.json
 
-# 3. Verifier: pin model/circuit/parameters with the verifier-owned manifest.
-#    The verifier independently obtains manifest.json from a zk-setup run they
-#    trust (e.g. their own) and the four public files it names. No original
-#    input, no proving key, no compiled circuit, no network.
+# 3. Registrar: record the trusted manifest+model in the verifier's local
+#    registry, then enable the version (new registrations start disabled).
+python -m zkml_quality model-registry register --registry registry.json \
+    --version 1.0.0 --manifest setup/manifest.json --model models/quality.onnx
+python -m zkml_quality model-registry enable --registry registry.json --version 1.0.0
+
+# 4. Verifier: pin model/circuit/parameters with the verifier-owned manifest
+#    and admit only registry-enabled model versions. The verifier independently
+#    obtains manifest.json from a zk-setup run they trust (e.g. their own) and
+#    the four public files it names. No original input, no proving key, no
+#    compiled circuit, no network.
 python -m zkml_quality zk-verify --credential credential.json \
+    --registry registry.json --model-version 1.0.0 \
     --manifest setup/manifest.json \
     --model models/quality.onnx --settings setup/settings.json \
     --vk setup/verification.key --srs setup/srs
@@ -42,9 +50,14 @@ prover's (they never receive `proving.key` or `compiled.ezkl`):
 
 ```sh
 mkdir -p verifier
-cp setup/manifest.json setup/settings.json setup/verification.key setup/srs verifier/
+cp setup/manifest.json setup/settings.json setup/srs verifier/
+cp setup/verification.key verifier/vk
 cp models/quality.onnx verifier/model.onnx
+python -m zkml_quality model-registry register --registry verifier/registry.json \
+    --version 1.0.0 --manifest verifier/manifest.json --model verifier/model.onnx
+python -m zkml_quality model-registry enable --registry verifier/registry.json --version 1.0.0
 python -m zkml_quality zk-verify --credential credential.json \
+    --registry verifier/registry.json --model-version 1.0.0 \
     --manifest verifier/manifest.json --model verifier/model.onnx \
     --settings verifier/settings.json --vk verifier/vk --srs verifier/srs
 ```
@@ -58,11 +71,45 @@ the ordinary ONNX floating-point scores from `infer`, which are never
 presented as proven. Labels follow the same rule as `infer`: the larger score
 wins, a tie is `normal`.
 
-Any failure — a missing `--manifest` or material file, an illegal/malformed
-manifest field or digest, a mismatch between the manifest's pinned digests and
-the supplied model/settings/VK/SRS, a credential that claims a different model
-or parameters, or proof/instances/public-output tampering — exits nonzero with
-a message on stderr and prints no success JSON.
+Any failure — a missing `--registry`/`--model-version`/`--manifest` or
+material file, a corrupt or structurally invalid registry, an unregistered or
+non-`enabled` model version, a mismatch between the registry record and the
+supplied manifest/model, an illegal/malformed manifest field or digest, a
+mismatch between the manifest's pinned digests and the supplied
+model/settings/VK/SRS, a credential that claims a different model or
+parameters, or proof/instances/public-output tampering — exits nonzero with a
+message on stderr and prints no success JSON.
+
+### Model registry (offline, local JSON)
+
+`model-registry` maintains the verifier's local registry of approved model
+versions. Verification is only admitted for a version whose record is
+`enabled` and pins exactly the trusted manifest and model at hand.
+
+```sh
+python -m zkml_quality model-registry register --registry registry.json \
+    --version 1.0.0 --manifest setup/manifest.json --model models/quality.onnx
+python -m zkml_quality model-registry list --registry registry.json
+python -m zkml_quality model-registry enable --registry registry.json --version 1.0.0
+python -m zkml_quality model-registry revoke --registry registry.json --version 1.0.0
+```
+
+* `--registry` names the local JSON file (created on first `register`);
+  `--version` must match `[A-Za-z0-9._-]+`. Everything runs offline.
+* `register` validates the caller-endorsed manifest and ONNX model (the model
+  must hash to the manifest's pinned digest) and atomically stores the model
+  and manifest SHA-256, the EZKL version, the output scale and the
+  settings/VK/SRS digests. New records start `disabled`. Re-registering the
+  same version with identical content is an idempotent no-op; conflicting
+  content is refused, never overwritten.
+* `list` prints all records ordered lexicographically by version.
+* `enable` moves a `disabled` record to `enabled` (repeating is a no-op).
+* `revoke` moves any existing record to `revoked`, which is irreversible:
+  a revoked version can never be re-enabled or overwritten. Repeating
+  `revoke` is a no-op.
+* A corrupt or structurally invalid registry is rejected by every command and
+  the file is left untouched; updates are atomic and never leave partial
+  output behind.
 
 ### Trust boundary: the verifier manifest is the root of trust
 
@@ -85,10 +132,13 @@ credential claims — a prover who controls the root of trust could otherwise
 rewrite the model digest and verification-parameter digests while reusing the
 old proof.
 
-Before any cryptographic check, `zk-verify` first hashes the verifier's own
-model, settings, VK and SRS and requires each digest to equal the value pinned
-in the verifier's manifest, and validates that the manifest's version/kind/
-digests are well-formed. It then cross-checks that the credential's embedded
+Before any cryptographic check, `zk-verify` first consults the registry: the
+requested `--model-version` must be registered and `enabled`, and the record
+must pin the exact SHA-256 of the supplied manifest and model as well as the
+manifest's EZKL version, output scale and settings/VK/SRS digests. It then
+hashes the verifier's own model, settings, VK and SRS and requires each
+digest to equal the value pinned in the verifier's manifest, and validates
+that the manifest's version/kind/digests are well-formed. It then cross-checks that the credential's embedded
 digests and output scale agree with the manifest (defence in depth — they can
 never override the manifest), confirms the pinned settings encode the same
 EZKL version and output scale, and finally runs EZKL verification driven
