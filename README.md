@@ -208,31 +208,56 @@ python -m zkml_quality proof-task retry  --store prover/tasks.json --task-id <id
 `create` takes exactly the `zk-prove` arguments (`--input`, `--model`,
 `--setup-dir`, `--credential`) and validates the whole request — the six
 features, the setup manifest, the model and every setup artifact — before the
-task id exists. The request is then sealed: the SHA-256 of the input, model,
-manifest and all five setup artifacts (plus the resolved argument set) are
-recorded, so anything changed or swapped between `create` and `run` fails the
-attempt with `digest_mismatch` without invoking EZKL. The feature values
+task id exists. The four filesystem arguments are resolved to **absolute,
+canonical paths** (symlinks and `..` collapsed) relative to the working
+directory of the `create` call and sealed in that form, so a later `run` or
+`retry` executed from a different directory always reopens exactly the files
+`create` validated — the same relative spelling never drifts onto files in the
+new working directory. The request is then sealed: the SHA-256 of the input,
+model, manifest and all five setup artifacts (plus the resolved argument set)
+are recorded, so anything changed or swapped between `create` and `run` fails
+the attempt with `digest_mismatch` without invoking EZKL. The feature values
 themselves are **never persisted**; the input file is read again at run time.
 
 Lifecycle and durability:
 
 * Only `queued → running → succeeded | failed` transitions occur. The claim
   (`running`) is committed to the store before proving starts, so a competing
-  `run` always fails with `conflict`; the full per-attempt history (attempt
-  number, state, started/ended, error code, credential digest) is retained and
-  never rewritten.
-* Success is recorded only after a real credential file exists: its
-  SHA-256 is stored in `credential_sha256` (and in the attempt record). A
-  failure or interruption can never report success, overwrite a pre-existing
-  credential, or drop history.
-* A `KeyboardInterrupt`/process death during proving is caught and recorded as
-  a `failed`, retryable attempt with code `interrupted` (an executor killed
-  before the failure can be journaled honestly remains `running` and can never
-  be claimed a second time).
+  `run` always fails with `conflict`; an additional per-attempt flock fences
+  the executor for the whole attempt (its fd is released automatically if the
+  process dies). The full per-attempt history (attempt number, state,
+  started/ended, error code, credential digest) is retained and never
+  rewritten.
+* Credential publication is a journaled, crash-recoverable commit. The proof
+  is written to a sibling staging file (`<credential>.proof-task.tmp`); only
+  after the staged file's SHA-256 is journaled on the running task in one
+  atomic store write is it renamed into place; the `succeeded` transition and
+  the journal clear then land together in the next atomic write. On the next
+  store open, a journaled publish whose owning attempt is no longer fenced
+  (i.e. its process died) is converged deterministically: intact staged file
+  and no final credential → publish and mark `succeeded`; final credential
+  already present with the journaled digest → mark `succeeded`; otherwise
+  discard the staged file and record a retryable `interrupted` failure. A live
+  fenced attempt is never preempted.
+* Success can therefore be interrupted at any point without inconsistency,
+  and a failure or interruption can never report success, overwrite a
+  pre-existing credential, or drop history. A non-succeeded task never leaves
+  a new credential at the target path (at most its staging file, which is
+  consumed on recovery or removed on the next claim).
+* A `KeyboardInterrupt`/process death during proving is caught and recorded
+  (when the failure itself can be journaled) as a `failed`, retryable attempt
+  with code `interrupted`. If the process is killed before that, the attempt
+  stays `running` while its executor is alive and can never be claimed a
+  second time; once the process is gone its attempt fence is free, and the
+  next store open converges it — publishing a journaled staged credential as
+  `succeeded`, or otherwise recording a retryable `interrupted` failure so the
+  task can be re-run.
 * Every store update is atomic: same-directory temp file, `fsync`,
-  `os.replace`. A missing, corrupt or structurally illegal store — including an
-  illegal on-disk state or a broken request seal — is refused and the existing
-  file is preserved byte-for-byte.
+  `os.replace` (and a directory fsync so the rename is durable). A missing,
+  corrupt or structurally illegal store — including an illegal on-disk state,
+  a broken request seal, or a journal that names anything other than the
+  task's own deterministic staging file — is refused and the existing file is
+  preserved byte-for-byte.
 
 Every **successful** command prints one JSON object to stdout and nothing to
 stderr, containing exactly `task_id`, `state`, `attempt`, `created_at`,
@@ -240,7 +265,8 @@ stderr, containing exactly `task_id`, `state`, `attempt`, `created_at`,
 command exits nonzero, writes nothing to stdout, and prints one JSON object to
 stderr whose `error` block carries a stable `code`, a boolean `retryable` and a
 fixed non-revealing `message` (a failed `run` also includes the post-transition
-task fields). The codes distinguish:
+task fields). Store and output-I/O failures are always `retryable: true`. The
+codes distinguish:
 
 | `error.code` | Meaning | retryable |
 | --- | --- | --- |
@@ -252,6 +278,8 @@ task fields). The codes distinguish:
 | `output_io_failure` | The credential could not be written | yes |
 | `interrupted` | The attempt was interrupted | yes |
 | `task_not_found` / `invalid_state` / `conflict` / `idempotency_conflict` | Store control failures | no |
+| `capacity_exceeded` | A create would exceed the store-wide queued-task limit | no |
+| `batch_not_found` | The named batch id does not exist | no |
 | `store_corrupt` / `store_io` | Task library corrupt/illegal or unreadable | no / yes |
 
 No output — success or failure — ever contains `features`, the input content,
@@ -260,6 +288,68 @@ the local worker needs them to perform the deferred proof. The produced
 credential is the standard `zk-quality-credential`, so `zk-verify`, the model
 registry, manifest pinning, quantisation and all credential-privacy behaviour
 are unchanged.
+
+### Batched proof tasks: `batch-create`, `batch-status`, `batch-run`
+
+A batch is an immutable group of ordinary proof tasks created atomically from
+one JSON file containing an `items` array. Each item carries exactly the
+single-task arguments (`input`, `model`, `setup_dir`, `credential`) and an
+optional `idempotency_key`; relative paths are canonicalized at
+`batch-create` time exactly as for `create`.
+
+```json
+{
+  "items": [
+    {"input": "samples/normal.json", "model": "models/quality.onnx",
+     "setup_dir": "setup", "credential": "out/cred-1.json",
+     "idempotency_key": "item-1"},
+    {"input": "samples/inspect.json", "model": "models/quality.onnx",
+     "setup_dir": "setup", "credential": "out/cred-2.json"}
+  ]
+}
+```
+
+```sh
+python -m zkml_quality proof-task batch-create --store prover/tasks.json \
+    --file batch.json [--max-queued <n>]
+# -> {batch_id, total, counts:{queued,running,succeeded,failed}, tasks:[...]}
+
+python -m zkml_quality proof-task batch-status --store prover/tasks.json \
+    --batch-id pb-…
+python -m zkml_quality proof-task batch-run    --store prover/tasks.json \
+    --batch-id pb-… --max-workers 4
+```
+
+* **batch-create** pre-flights *every* item (features, manifest, model and all
+  setup artifacts) before anything is written; any invalid item, an
+  idempotency key reused inside the file, or a key already stored against a
+  different request rejects the **whole** batch and writes no bytes. With all
+  items carrying idempotency keys that resolve to one existing batch, replaying
+  the file returns that same stable `batch_id`; partial overlap with existing
+  tasks is rejected. The batch summary and all member tasks land in a single
+  atomic update, and members are assigned gap-free creation-order sequence
+  numbers. `--max-queued` limits the number of `queued` tasks across the
+  **whole** store (not just the batch); exceeding it is the non-retryable
+  `capacity_exceeded` and the batch is not written.
+* **batch-status** (located with `--batch-id`) returns the total, the four
+  state counts and the safe task views in creation order; an unknown id is
+  `batch_not_found`.
+* **batch-run** (`--batch-id`, `--max-workers`) claims **only** tasks that
+  belong to the batch, each under the exclusive store lock with the ordinary
+  mutual exclusion, and executes the real EZKL proofs with at most
+  `--max-workers` concurrent proofs (a positive integer; invalid otherwise).
+  One item failing never blocks or cancels the others — each keeps the normal
+  claim/attempt/retry semantics, so a retryable batch item can later be
+  retried and run with the single-task commands.
+
+Both batch commands, like the single-task commands, print exactly one JSON
+object to **stdout** on success (nothing on stderr) and, on failure, exit
+nonzero with exactly one safe JSON object on **stderr** (nothing on stdout).
+The batch output contains only the total, the four state counts and the same
+safe per-task fields as the single-task view — never `features`, input
+content, proofs or any path. The batch table, the task store and all recovery
+records are updated atomically together; a corrupt store is refused with its
+original bytes unchanged.
 
 ### Credential format
 

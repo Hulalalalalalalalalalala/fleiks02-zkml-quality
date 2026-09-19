@@ -327,8 +327,13 @@ def load_verifier_materials(manifest_path, model, settings_path, vk_path, srs_pa
 
 
 def _artifact_paths(setup_dir):
-    return {key: _require_file(setup_dir / name, f"setup artifact '{name}'")
-            for key, name in ARTIFACT_NAMES.items()}
+    paths = {}
+    for key, name in ARTIFACT_NAMES.items():
+        path = setup_dir / name
+        if not path.is_file():
+            raise ZkArtifactMissing(f"setup artifact '{name}' not found")
+        paths[key] = path
+    return paths
 
 
 def _check_artifacts(manifest, paths):
