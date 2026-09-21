@@ -178,6 +178,71 @@ two are compared on every verification, so a stale or altered registry record
 cannot point verification at different settings/VK/SRS than the manifest
 pins.
 
+### Offline batch verification: `zk-verify-batch`
+
+`zk-verify-batch` verifies many credentials in one offline run against the
+exact same seven verifier-chosen trust parameters as `zk-verify`
+(`--registry`, `--model-version`, `--manifest`, `--model`, `--settings`,
+`--vk`, `--srs`). The credentials are named in a batch descriptor read from
+`--file`; there is still no input, no proving key, no compiled circuit and no
+network, and nothing is written.
+
+```json
+{
+  "items": [
+    {"id": "cred-1", "credential": "verifier/in/cred-1.json"},
+    {"id": "cred-2", "credential": "verifier/in/cred-2.json"}
+  ]
+}
+```
+
+```sh
+python -m zkml_quality zk-verify-batch --file verifier/batch.json \
+    --registry verifier/registry.json --model-version v1 \
+    --manifest verifier/manifest.json --model verifier/model.onnx \
+    --settings verifier/settings.json --vk verifier/vk --srs verifier/srs
+# -> {"total": 2, "accepted": 1, "rejected": 1, "results": [ ... ]}
+```
+
+The descriptor is treated as hostile input. Its top level must be an object
+containing **only** a non-empty `items` array of at most **256** entries; each
+item must be an object containing **only** `id` and `credential`. The `id` is
+a non-empty token matching `[A-Za-z0-9._-]+` and must be unique within the
+batch, and `credential` is a non-empty path string. Duplicate JSON keys (at
+any level), unknown fields, a non-array/empty/oversized `items`, an illegal
+or repeated id, or any other structural error rejects the **whole batch
+before verification starts**.
+
+The verifier trust material is resolved **once**, before any credential is
+read: the enabled registry record must be admitted and agree with the
+verifier's own manifest, and the model/settings/VK/SRS must hash to the
+digests the manifest pins. A missing or corrupt registry, an
+unregistered/disabled/revoked version, a registry/manifest mismatch, or any
+material whose digest disagrees aborts the whole batch — no item is verified
+and no per-item result exists.
+
+Only after both gates pass are the items processed **in input order**, each
+with the real EZKL verifier and the same quantisation, tie and privacy rules
+as `zk-verify`. One bad credential never blocks the others; each rejection
+carries only `id`, `accepted: false` and a fixed `error` block:
+
+| `error.code` | When |
+| --- | --- |
+| `credential_missing` | The named credential file is absent or unreadable |
+| `credential_invalid` | Malformed credential JSON/structure or wrong digest/format |
+| `verification_failed` | A tampered proof or public output, or EZKL rejects it |
+
+An accepted item carries `id`, `accepted: true` and the same success fields
+as `zk-verify` (`verified`, `model_sha256`, `quantized_scores`,
+`scores_fixed_point`, `label`). Processing always **exits 0** once the
+descriptor and trust material were valid, even when some or every item was
+rejected, and prints exactly one JSON object to stdout (`total`, `accepted`,
+`rejected`, `results` in input order) and nothing on stderr. A malformed
+descriptor or failed trust preflight instead exits **nonzero**, prints
+nothing to stdout and exactly one safe JSON object to stderr
+(`invalid_batch` / `trust_check_failed`). No output — at either level — ever
+contains a file path, features, input, proof bytes or raw exception text.
+
 ### Durable proof tasks: `proof-task`
 
 `proof-task` wraps the prover side of the loop in a durable, strictly

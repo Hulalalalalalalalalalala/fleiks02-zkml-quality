@@ -576,6 +576,128 @@ def _load_credential(credential_path):
     return credential
 
 
+def prepare_verifier_context(manifest_path, model, settings_path, vk_path, srs_path,
+                             registry_path, model_version):
+    """Resolve everything a verification depends on, before touching any proof.
+
+    This is the trust phase shared by single and batch verification. It runs
+    the registry admission gate, hashes every verifier-owned material against
+    the verifier's own manifest, binds the admitted registry record to that
+    manifest, and independently confirms the pinned settings encode the EZKL
+    version and output scale the manifest describes. No credential is read
+    here, so none of these decisions can be steered by credential content.
+    Returns reusable, non-sensitive context (paths, digests and scale).
+    """
+    # Registry gate first: before hashing anything or touching a credential,
+    # only an explicitly enabled version in a valid verifier-owned registry
+    # may be verified at all. A missing/corrupt registry or an unknown,
+    # disabled or revoked version stops verification here.
+    record = admit_version(registry_path, model_version)
+
+    # Bind model, circuit (via the VK generated for it) and verification
+    # parameters to the verifier's manifest, then compare the admitted record
+    # against it field by field. Both consult only verifier-owned files;
+    # nothing in a credential can affect either decision.
+    materials = load_verifier_materials(
+        manifest_path, model, settings_path, vk_path, srs_path)
+    manifest = materials["manifest"]
+    paths = materials["paths"]
+    model_sha = materials["model_sha256"]
+    scale = materials["output_scale"]
+    require_record_matches(record, manifest_sha=_sha256(manifest_path), manifest=manifest)
+
+    # Independently confirm the pinned settings file really carries the scale
+    # and EZKL version the manifest/credential describe.
+    try:
+        settings_doc = json.loads(paths["settings"].read_text(encoding="utf-8"))
+        settings_scale = int(settings_doc["model_output_scales"][0])
+        settings_version = str(settings_doc["version"])
+    except (OSError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as error:
+        raise ZkError(f"settings file is unreadable: {error}") from error
+    if settings_version != manifest["ezkl_version"]:
+        raise ZkError(
+            f"settings were produced with EZKL {settings_version}, "
+            f"manifest pins EZKL {manifest['ezkl_version']}")
+    if settings_scale != scale:
+        raise ZkError("settings output scale does not match the verifier manifest")
+
+    return {
+        "manifest": manifest,
+        "paths": paths,
+        "model_sha256": model_sha,
+        "output_scale": scale,
+        "settings_scale": settings_scale,
+    }
+
+
+def _check_credential_claims(credential, context):
+    """Cross-check a loaded credential against the trusted context.
+
+    Defence in depth — the credential can never weaken verification because
+    EZKL is driven solely by the manifest-pinned files — but a credential that
+    claims a different model or parameters is rejected outright rather than
+    accepted over a valid proof.
+    """
+    manifest = context["manifest"]
+    model_sha = context["model_sha256"]
+    scale = context["output_scale"]
+    if credential["model_sha256"] != model_sha:
+        raise ZkError("credential model digest does not match the verifier manifest")
+    claimed = credential["verification_artifacts"]
+    expected_artifacts = {
+        "settings_sha256": manifest["artifacts"]["settings"],
+        "vk_sha256": manifest["artifacts"]["vk"],
+        "srs_sha256": manifest["artifacts"]["srs"],
+    }
+    for key, expected_digest in expected_artifacts.items():
+        if claimed[key] != expected_digest:
+            raise ZkError(f"credential {key} does not match the verifier manifest")
+    if credential["ezkl_version"] != manifest["ezkl_version"]:
+        raise ZkError("credential EZKL version does not match the verifier manifest")
+    if credential["public_output"]["output_scale"] != scale:
+        raise ZkError("credential output scale does not match the verifier manifest")
+
+
+def _run_ezkl_verify(credential, context):
+    """Drive real EZKL verification from the manifest-pinned materials.
+
+    The proof is staged in a private scratch directory; EZKL is never handed a
+    caller-controlled path. Returns True only when EZKL accepts the proof.
+    """
+    paths = context["paths"]
+    with tempfile.TemporaryDirectory(prefix="zkverify-") as scratch:
+        proof_path = Path(scratch) / "proof.pf"
+        proof_path.write_text(json.dumps(credential["proof"]), encoding="utf-8")
+        with _quiet_stderr():
+            accepted = ezkl.verify(str(proof_path), str(paths["settings"]), str(paths["vk"]),
+                                   str(paths["srs"]), False)
+    return accepted is True
+
+
+def verify_credential_document(credential, context):
+    """Verify one already-loaded credential against a prepared trust context.
+
+    Used by both ``run_verify`` and batch verification: the expensive trust
+    phase (``prepare_verifier_context``) runs once, then each credential is
+    cross-checked, cryptographically verified by real EZKL, and finally its
+    published public output is required to agree with the proven instances.
+    Returns the same public success fields as ``run_verify``.
+    """
+    _check_credential_claims(credential, context)
+    if not _run_ezkl_verify(credential, context):
+        raise ZkError("proof verification failed")
+
+    scores, fixed_point, label = _decode_instances(
+        credential["proof"]["instances"], context["settings_scale"])
+    if scores != credential["public_output"]["quantized_scores"]:
+        raise ZkError("credential public scores do not match the proven instances")
+    if label != credential["public_output"]["label"]:
+        raise ZkError("credential label does not match the proven instances")
+
+    return {"verified": True, "model_sha256": context["model_sha256"],
+            "quantized_scores": scores, "scores_fixed_point": fixed_point, "label": label}
+
+
 def run_verify(credential_path, manifest_path, model, settings_path, vk_path, srs_path,
                registry_path, model_version):
     """Verify a credential offline against the verifier's own trust material.
@@ -596,77 +718,8 @@ def run_verify(credential_path, manifest_path, model, settings_path, vk_path, sr
     proof for a different circuit/key cannot pass EZKL against the pinned VK
     and settings.
     """
-    # Registry gate first: before hashing anything or touching the credential,
-    # only an explicitly enabled version in a valid verifier-owned registry
-    # may be verified at all. A missing/corrupt registry or an unknown,
-    # disabled or revoked version stops verification here.
-    record = admit_version(registry_path, model_version)
-
-    # Bind model, circuit (via the VK generated for it) and verification
-    # parameters to the verifier's manifest, then compare the admitted record
-    # against it field by field. Both consult only verifier-owned files;
-    # nothing in the credential can affect either decision.
-    materials = load_verifier_materials(
-        manifest_path, model, settings_path, vk_path, srs_path)
-    manifest = materials["manifest"]
-    paths = materials["paths"]
-    model_sha = materials["model_sha256"]
-    scale = materials["output_scale"]
-    require_record_matches(record, manifest_sha=_sha256(manifest_path), manifest=manifest)
-
+    context = prepare_verifier_context(
+        manifest_path, model, settings_path, vk_path, srs_path,
+        registry_path, model_version)
     credential = _load_credential(credential_path)
-
-    # Cross-checks against the manifest. These are defence in depth — the
-    # credential values cannot weaken verification because EZKL is driven
-    # solely by the manifest-pinned files — but a credential that claims a
-    # different model or parameters is rejected outright rather than accepted
-    # over a valid proof.
-    if credential["model_sha256"] != model_sha:
-        raise ZkError("credential model digest does not match the verifier manifest")
-    claimed = credential["verification_artifacts"]
-    expected_artifacts = {
-        "settings_sha256": manifest["artifacts"]["settings"],
-        "vk_sha256": manifest["artifacts"]["vk"],
-        "srs_sha256": manifest["artifacts"]["srs"],
-    }
-    for key, expected_digest in expected_artifacts.items():
-        if claimed[key] != expected_digest:
-            raise ZkError(f"credential {key} does not match the verifier manifest")
-    if credential["ezkl_version"] != manifest["ezkl_version"]:
-        raise ZkError("credential EZKL version does not match the verifier manifest")
-    if credential["public_output"]["output_scale"] != scale:
-        raise ZkError("credential output scale does not match the verifier manifest")
-
-    # Independently confirm the pinned settings file really carries the scale
-    # and EZKL version the manifest/credential describe.
-    try:
-        settings_doc = json.loads(paths["settings"].read_text(encoding="utf-8"))
-        settings_scale = int(settings_doc["model_output_scales"][0])
-        settings_version = str(settings_doc["version"])
-    except (OSError, json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError) as error:
-        raise ZkError(f"settings file is unreadable: {error}") from error
-    if settings_version != manifest["ezkl_version"]:
-        raise ZkError(
-            f"settings were produced with EZKL {settings_version}, "
-            f"manifest pins EZKL {manifest['ezkl_version']}")
-    if settings_scale != scale:
-        raise ZkError("settings output scale does not match the verifier manifest")
-
-    with tempfile.TemporaryDirectory(prefix="zkverify-") as scratch:
-        proof_path = Path(scratch) / "proof.pf"
-        proof_path.write_text(json.dumps(credential["proof"]), encoding="utf-8")
-        with _quiet_stderr():
-            accepted = ezkl.verify(str(proof_path), str(paths["settings"]), str(paths["vk"]),
-                                   str(paths["srs"]), False)
-        if accepted is not True:
-            raise ZkError("proof verification failed")
-
-    scores, fixed_point, label = _decode_instances(
-        credential["proof"]["instances"], settings_scale)
-    if scores != credential["public_output"]["quantized_scores"]:
-        raise ZkError("credential public scores do not match the proven instances")
-    if label != credential["public_output"]["label"]:
-        raise ZkError("credential label does not match the proven instances")
-
-    return {"verified": True, "model_sha256": model_sha,
-            "quantized_scores": scores, "scores_fixed_point": fixed_point, "label": label}
+    return verify_credential_document(credential, context)
