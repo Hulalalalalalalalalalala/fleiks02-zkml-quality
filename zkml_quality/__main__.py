@@ -23,6 +23,7 @@ from .tasks import (
     run_task,
     status_task,
 )
+from .verify_batch import CODE_INTERNAL, BatchError, verify_batch
 from .zk import ZkError, run_prove, run_setup, run_verify
 
 
@@ -63,6 +64,34 @@ def _parser():
     verify.add_argument("--settings", required=True, type=Path)
     verify.add_argument("--vk", required=True, type=Path, help="Verification key")
     verify.add_argument("--srs", required=True, type=Path)
+
+    batch_verify = sub.add_parser(
+        "zk-verify-batch",
+        help="Verify a batch of credentials from a --file descriptor against the "
+             "same verifier trust parameters as zk-verify; offline, no writes")
+
+    def add_verify_trust_arguments(target):
+        target.add_argument(
+            "--registry", required=True, type=Path,
+            help="verifier-owned local model registry JSON; only enabled versions are admitted")
+        target.add_argument(
+            "--model-version", required=True,
+            help="registry version ([A-Za-z0-9._-]+) every credential is verified against")
+        target.add_argument(
+            "--manifest", required=True, type=Path,
+            help="manifest.json from a zk-setup run the verifier independently obtained and trusts")
+        target.add_argument("--model", required=True, type=Path,
+                            help="Verifier-chosen ONNX model")
+        target.add_argument("--settings", required=True, type=Path)
+        target.add_argument("--vk", required=True, type=Path, help="Verification key")
+        target.add_argument("--srs", required=True, type=Path)
+
+    add_verify_trust_arguments(batch_verify)
+    batch_verify.add_argument(
+        "--file", required=True, type=Path,
+        help='JSON file containing exactly an "items" array (1..256); each item '
+             'is {"id", "credential"} with a batch-unique id matching '
+             "[A-Za-z0-9._-]+")
 
     registry = sub.add_parser(
         "model-registry",
@@ -195,6 +224,17 @@ def _print_error(error, view=None):
     print(json.dumps(payload, ensure_ascii=False, allow_nan=False), file=sys.stderr)
 
 
+def _print_batch_error(error):
+    """Emit exactly one safe JSON object describing a batch command failure.
+
+    Nothing is written to stdout; the fixed message never embeds a path or
+    exception text.
+    """
+    print(json.dumps(
+        {"error": {"code": error.code, "message": str(error)}},
+        ensure_ascii=False, allow_nan=False), file=sys.stderr)
+
+
 def _task_view_payload(view):
     """Every successful proof-task command returns exactly these fields."""
     return {
@@ -304,6 +344,20 @@ def main():
                 return 2
             except Exception:  # noqa: BLE001 - safety net, message is generic
                 _print_error(RuntimeError("internal error"))
+                return 2
+        elif args.command == "zk-verify-batch":
+            # A bad descriptor or a failed one-time trust gate is a command-
+            # level failure (nonzero, empty stdout, one safe stderr JSON).
+            # Per-item rejections are part of the result and still exit 0.
+            try:
+                result = verify_batch(
+                    args.file, args.manifest, args.model, args.settings,
+                    args.vk, args.srs, args.registry, args.model_version)
+            except BatchError as error:
+                _print_batch_error(error)
+                return 2
+            except Exception:  # noqa: BLE001 - safety net, generic code only
+                _print_batch_error(BatchError(CODE_INTERNAL))
                 return 2
         else:
             result = run_verify(args.credential, args.manifest, args.model,

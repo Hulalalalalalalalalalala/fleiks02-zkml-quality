@@ -15,7 +15,7 @@ The current interface runs ordinary local inference and a two-sample demo. It do
 
 ## Zero-knowledge proofs (EZKL 23.0.5, CPU, offline)
 
-Four additional subcommands run a real proving loop with [EZKL](https://github.com/zkonduit/ezkl) 23.0.5, plus a local model registry that gates verification. Input features stay private; only the two circuit outputs are public instances. Nothing is mocked or replaced by digests, and no network is contacted.
+Four additional subcommands run a real proving loop with [EZKL](https://github.com/zkonduit/ezkl) 23.0.5, plus a local model registry that gates verification, and a `zk-verify-batch` command that verifies many credentials in one offline run. Input features stay private; only the two circuit outputs are public instances. Nothing is mocked or replaced by digests, and no network is contacted.
 
 ```sh
 # 1. Compile the circuit and generate settings, SRS, proving and verification keys.
@@ -177,6 +177,93 @@ manifest remains the **root of trust** for the cryptographic material. The
 two are compared on every verification, so a stale or altered registry record
 cannot point verification at different settings/VK/SRS than the manifest
 pins.
+
+### Batch verification: `zk-verify-batch`
+
+`zk-verify-batch` verifies many credentials in one offline run against the
+**same** verifier-owned trust parameters as `zk-verify`. It takes the same
+seven trust arguments (`--registry`, `--model-version`, `--manifest`,
+`--model`, `--settings`, `--vk`, `--srs`) plus `--file` naming a batch
+descriptor:
+
+```json
+{
+  "items": [
+    {"id": "unit-001", "credential": "inbox/cred-1.json"},
+    {"id": "unit-002", "credential": "inbox/cred-2.json"}
+  ]
+}
+```
+
+```sh
+python -m zkml_quality zk-verify-batch --file batch.json \
+    --registry verifier/registry.json --model-version v1 \
+    --manifest verifier/manifest.json --model verifier/model.onnx \
+    --settings verifier/settings.json --vk verifier/vk --srs verifier/srs
+```
+
+The descriptor is validated strictly and treated as hostile input:
+
+* The top level must be an object containing **only** a non-empty `items`
+  array of at most **256** entries. Unknown top-level fields, a missing/empty
+  `items`, or invalid JSON (including duplicate keys) reject the whole batch.
+* Each item must be an object containing **only** `id` and `credential`. The
+  id must be a non-empty token matching `[A-Za-z0-9._-]+` and must be unique
+  within the batch; the credential must be a non-empty path string. Unknown
+  fields, duplicate item keys, or a repeated/illegal id reject the whole
+  batch.
+
+Descriptor validation happens **before** anything else. Next the one-time
+trust gate — registry admission, the trusted manifest/materials, and the
+record comparison, exactly as in `zk-verify` — runs once; if it fails (an
+unregistered/`disabled`/`revoked` version, a corrupt registry, a record that
+does not match the manifest, or a model/settings/VK/SRS file that does not
+hash to its pinned digest) the **whole batch terminates** and no item is
+verified.
+
+Only after both checks do items run in input order, each performing the real
+offline EZKL verification against the same trusted materials. A single bad
+item never blocks the others. Per-item outcomes use three codes:
+
+| Result `error.code` | Meaning |
+| --- | --- |
+| `credential_missing` | The named credential file is absent or unreadable |
+| `credential_invalid` | Bad JSON/structure/format, or a digest/parameter that disagrees with the trusted manifest |
+| `verification_failed` | The credential was well-formed but EZKL rejected the proof, or its public-output summary contradicts the proven instances (tampered proof/public output) |
+
+On completion the command **exits 0 even when items were rejected** and prints
+exactly one JSON object to stdout:
+
+```json
+{
+  "total": 3,
+  "accepted": 1,
+  "rejected": 2,
+  "results": [
+    {"id": "unit-001", "accepted": true, "model_sha256": "…",
+     "quantized_scores": [6144, 2048],
+     "scores_fixed_point": [0.75, 0.25], "label": "normal"},
+    {"id": "unit-002", "accepted": false,
+     "error": {"code": "credential_missing",
+               "message": "the credential could not be read"}},
+    {"id": "unit-003", "accepted": false,
+     "error": {"code": "verification_failed",
+               "message": "the proof failed verification"}}
+  ]
+}
+```
+
+`results` follows the descriptor order. An accepted entry carries `id`,
+`accepted: true` and the same fields as a successful `zk-verify`; a rejected
+entry carries only `id`, `accepted: false`, `error.code` and a fixed,
+non-revealing `error.message`. No entry — and no message — ever contains a
+file path, features, input data, proof bytes or an exception string.
+
+A bad descriptor or a failed trust gate is a command-level failure: nonzero
+exit, **empty stdout**, and exactly one JSON object on stderr
+(`{"error": {"code": …, "message": …}}` with code `invalid_batch` or
+`trust_verification_failed` and a fixed message). The command is fully
+offline and never writes, modifies or deletes any file.
 
 ### Durable proof tasks: `proof-task`
 
